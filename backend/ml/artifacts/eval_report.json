@@ -1,0 +1,71 @@
+{
+  "random_state": 42,
+  "test_size": 0.2,
+  "n_train": 3200,
+  "n_test": 800,
+  "logistic_regression": {
+    "model": "Logistic Regression (baseline)",
+    "accuracy": 0.70375,
+    "precision": 0.6611295681063123,
+    "recall": 0.5958083832335329,
+    "f1": 0.6267716535433071,
+    "roc_auc": 0.7676428259361106,
+    "confusion_matrix": [
+      [
+        364,
+        102
+      ],
+      [
+        135,
+        199
+      ]
+    ]
+  },
+  "logistic_regression_train_roc_auc": 0.7837625274456597,
+  "xgboost": {
+    "model": "XGBoost (primary, tuned + interaction features)",
+    "accuracy": 0.7,
+    "precision": 0.660958904109589,
+    "recall": 0.5778443113772455,
+    "f1": 0.6166134185303515,
+    "roc_auc": 0.7658020868134974,
+    "confusion_matrix": [
+      [
+        367,
+        99
+      ],
+      [
+        141,
+        193
+      ]
+    ],
+    "best_params": {
+      "model__learning_rate": 0.03,
+      "model__max_depth": 3,
+      "model__min_child_weight": 1,
+      "model__n_estimators": 100
+    },
+    "best_cv_roc_auc": 0.7743420044530034,
+    "feature_set": "FEATURE_COLUMNS_WITH_INTERACTIONS (see experiment_interactions.py for why)"
+  },
+  "xgboost_train_vs_test": {
+    "train_accuracy": 0.718125,
+    "train_roc_auc": 0.8003858953096378
+  },
+  "optimality_gap": {
+    "n_events": 800,
+    "optimality_match_rate": 0.4575,
+    "mean_gap_all": 0.057182375,
+    "mean_gap_when_mismatched": 0.10540529953917051,
+    "median_gap_all": 0.010050000000000003,
+    "max_gap": 0.547,
+    "action_coverage_counts": {
+      "retry_link": 172,
+      "reminder": 0,
+      "discount_offer": 99,
+      "escalate_to_human": 529,
+      "no_action": 0
+    },
+    "n_actions_ever_top_pick": 3
+  }
+}

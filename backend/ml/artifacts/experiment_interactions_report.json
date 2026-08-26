@@ -1,0 +1,44 @@
+{
+  "A_xgb_baseline_depth3": {
+    "test_roc_auc": 0.7635501529130581,
+    "optimality_match_rate": 0.385,
+    "mean_gap_all": 0.075158,
+    "mean_gap_when_mismatched": 0.12220813008130083,
+    "n_actions_ever_top_pick": 2,
+    "action_coverage_counts": {
+      "retry_link": 236,
+      "reminder": 0,
+      "discount_offer": 0,
+      "escalate_to_human": 564,
+      "no_action": 0
+    }
+  },
+  "B_xgb_interaction_features": {
+    "test_roc_auc": 0.7658020868134974,
+    "optimality_match_rate": 0.4575,
+    "mean_gap_all": 0.057182375,
+    "mean_gap_when_mismatched": 0.10540529953917051,
+    "n_actions_ever_top_pick": 3,
+    "action_coverage_counts": {
+      "retry_link": 172,
+      "reminder": 0,
+      "discount_offer": 99,
+      "escalate_to_human": 529,
+      "no_action": 0
+    }
+  },
+  "C_xgb_depth4": {
+    "test_roc_auc": 0.7636850761995323,
+    "optimality_match_rate": 0.38375,
+    "mean_gap_all": 0.0740775,
+    "mean_gap_when_mismatched": 0.12020689655172413,
+    "n_actions_ever_top_pick": 3,
+    "action_coverage_counts": {
+      "retry_link": 247,
+      "reminder": 0,
+      "discount_offer": 5,
+      "escalate_to_human": 548,
+      "no_action": 0
+    }
+  }
+}

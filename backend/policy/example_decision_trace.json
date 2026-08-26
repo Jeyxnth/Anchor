@@ -1,0 +1,86 @@
+{
+  "transaction_id": "TXN000000",
+  "customer_context": {
+    "customer_age_days": 762,
+    "lifetime_value": 2991.34,
+    "previous_success_rate": 0.5,
+    "average_order_value": 631.99,
+    "previous_recovery_successes": 0,
+    "days_since_last_purchase": 110
+  },
+  "transaction_context": {
+    "amount": 1461.83,
+    "event_type": "checkout_abandoned",
+    "failure_reason": "bank_decline",
+    "time_of_day": 0,
+    "day_of_week": 0
+  },
+  "compliance_state": {
+    "opted_out": false,
+    "attempts_so_far_24h": 0,
+    "last_contact_time": null
+  },
+  "predicted_probabilities_all_actions": {
+    "retry_link": 0.3502,
+    "reminder": 0.31,
+    "discount_offer": 0.3529,
+    "escalate_to_human": 0.3552,
+    "no_action": 0.2108
+  },
+  "eligible_actions": [
+    "retry_link",
+    "escalate_to_human",
+    "reminder",
+    "discount_offer",
+    "no_action"
+  ],
+  "candidates_ev_ranked": [
+    {
+      "action": "retry_link",
+      "predicted_probability": 0.3502,
+      "recoverable_amount": 1461.83,
+      "intervention_cost": 2.0,
+      "discount_cost": 0.0,
+      "expected_value": 509.95
+    },
+    {
+      "action": "escalate_to_human",
+      "predicted_probability": 0.3552,
+      "recoverable_amount": 1461.83,
+      "intervention_cost": 40.0,
+      "discount_cost": 0.0,
+      "expected_value": 479.23
+    },
+    {
+      "action": "reminder",
+      "predicted_probability": 0.31,
+      "recoverable_amount": 1461.83,
+      "intervention_cost": 1.0,
+      "discount_cost": 0.0,
+      "expected_value": 452.17
+    },
+    {
+      "action": "discount_offer",
+      "predicted_probability": 0.3529,
+      "recoverable_amount": 1461.83,
+      "intervention_cost": 0.0,
+      "discount_cost": 146.18,
+      "expected_value": 369.7
+    },
+    {
+      "action": "no_action",
+      "predicted_probability": 0.2108,
+      "recoverable_amount": 1461.83,
+      "intervention_cost": 0.0,
+      "discount_cost": 0.0,
+      "expected_value": 308.11
+    }
+  ],
+  "agent_decision": {
+    "action": "retry_link",
+    "reason": "Highest expected value (Rs 509.95) among 5 allowed candidate(s); predicted recovery probability 35.0% on Rs 1461.83 at risk.",
+    "provider": "rule_based_fallback",
+    "valid": true,
+    "validation_note": null
+  }
+}
