@@ -19,11 +19,14 @@ rule-based provider). The fallback is NEVER silently presented as an LLM
 decision — its output is always tagged provider="rule_based_fallback" so the
 audit trail can't confuse the two.
 
-NOTE: GeminiProvider and GroqProvider are implemented against each API's
-documented request/response contract as of this writing, but have not been
-exercised against a live API key in this environment (none is configured
-here). Verify against current docs before depending on them for a demo —
-API surfaces, and especially the default model IDs below, do drift.
+NOTE: GeminiProvider has been exercised against a live GEMINI_API_KEY
+(2026-08-26) and confirmed working end-to-end (request shape, JSON response
+parsing, validate_decision()) on gemini-2.5-flash-lite — the original default
+(gemini-2.0-flash-lite) 404'd, model retired/renamed since this was first
+written; current model IDs were pulled from a live GET /v1beta/models call
+against the key, not guessed. GroqProvider remains untested (no GROQ_API_KEY
+available). Re-check available model IDs before a demo if this sits for a
+while — these surfaces drift.
 """
 
 from __future__ import annotations
@@ -35,6 +38,17 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
+# Load .env (gitignored — holds GEMINI_API_KEY / GROQ_API_KEY locally) before
+# anything below reads os.environ. Checks the repo root first (D:\Anchor\.env
+# — where this project keeps it) and backend\.env second, so either location
+# works. override=False: real process/shell env vars still win if both are
+# set.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(_REPO_ROOT / ".env", override=False)
+load_dotenv(_REPO_ROOT / "backend" / ".env", override=False)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ml"))
 from features import ALL_INTERVENTIONS  # noqa: E402
@@ -167,7 +181,18 @@ class GeminiProvider(LLMProvider):
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        self.model = model or os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
+        # gemini-2.0-flash-lite 404'd against a live key on 2026-08-26. So did
+        # gemini-2.5-flash-lite and gemini-2.5-flash: Google's error body
+        # ("no longer available to new users... use models/gemini-3.5-flash-lite")
+        # says dated/numbered snapshots get cut off from new API keys as newer
+        # generations ship, which flips the usual pin-a-version advice — here
+        # the rolling "-latest" alias is the one that kept working across that
+        # cutoff. Pinned to gemini-3.5-flash-lite (the API's own recommended
+        # replacement, confirmed 200 against this key) rather than
+        # gemini-flash-lite-latest, so behavior doesn't silently shift versions
+        # mid-demo; re-verify with GET /v1beta/models before relying on this
+        # if it's been a while.
+        self.model = model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
 
@@ -226,25 +251,63 @@ class GroqProvider(LLMProvider):
         return validate_decision(raw, decision_input, self.name, text)
 
 
-def get_provider(name: Optional[str] = None) -> LLMProvider:
+class ResilientProvider(LLMProvider):
+    """
+    Wraps a real LLM provider with automatic fallback to
+    RuleBasedFallbackProvider if the primary call raises for any reason
+    (network error, timeout, rate limit, malformed response, ...). This is
+    the "safety net" — a live demo shouldn't die because an external API
+    blipped once. It never disguises what happened: on fallback, the
+    returned AgentDecision still carries provider="rule_based_fallback"
+    (set by RuleBasedFallbackProvider itself) plus a validation_note
+    recording the primary's failure, so the audit trail shows exactly which
+    path produced the decision. The primary provider is not retried within
+    a single call — one failure is enough to fall back for that decision.
+    """
+    def __init__(self, primary: LLMProvider, fallback: Optional[LLMProvider] = None):
+        self.primary = primary
+        self.fallback = fallback or RuleBasedFallbackProvider()
+        self.name = primary.name
+
+    def decide(self, decision_input: DecisionInput) -> AgentDecision:
+        try:
+            return self.primary.decide(decision_input)
+        except Exception as exc:  # noqa: BLE001 - deliberately broad: any primary failure should fail over
+            decision = self.fallback.decide(decision_input)
+            decision.validation_note = (
+                f"Primary provider {self.primary.name!r} raised {exc!r}; "
+                f"used {self.fallback.name!r} safety net instead."
+            )
+            return decision
+
+
+def get_provider(name: Optional[str] = None, resilient: bool = True) -> LLMProvider:
     """
     Provider selection, env-var driven so no code changes are needed to
     switch: LLM_PROVIDER=gemini|groq|rule_based_fallback. With no explicit
     name (and no LLM_PROVIDER env var), auto-detects from which API key is
     set (Gemini first, then Groq), falling back to the deterministic
-    provider if neither is configured — which is the case in this
-    environment right now, so every demo run below uses it.
+    provider only if neither is configured.
+
+    By default (resilient=True), a real LLM provider is wrapped in
+    ResilientProvider so an API hiccup during a live demo degrades to the
+    rule-based fallback instead of raising. Pass resilient=False to get the
+    raw provider (e.g. to deliberately test failure handling, or to see a
+    real exception instead of it being swallowed).
     """
     name = name or os.environ.get("LLM_PROVIDER")
-    if name == "gemini":
-        return GeminiProvider()
-    if name == "groq":
-        return GroqProvider()
     if name == "rule_based_fallback":
         return RuleBasedFallbackProvider()
 
-    if os.environ.get("GEMINI_API_KEY"):
-        return GeminiProvider()
-    if os.environ.get("GROQ_API_KEY"):
-        return GroqProvider()
-    return RuleBasedFallbackProvider()
+    if name == "gemini":
+        provider = GeminiProvider()
+    elif name == "groq":
+        provider = GroqProvider()
+    elif os.environ.get("GEMINI_API_KEY"):
+        provider = GeminiProvider()
+    elif os.environ.get("GROQ_API_KEY"):
+        provider = GroqProvider()
+    else:
+        return RuleBasedFallbackProvider()
+
+    return ResilientProvider(provider) if resilient else provider

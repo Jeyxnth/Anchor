@@ -1,3 +1,6 @@
 backend/.venv/
 **/__pycache__/
 *.pyc
+.env
+backend/.env
+backend/app/ledger.db

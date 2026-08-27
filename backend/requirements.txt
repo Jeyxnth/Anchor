@@ -8,3 +8,5 @@ uvicorn[standard]
 pydantic
 python-multipart
 joblib
+requests
+python-dotenv

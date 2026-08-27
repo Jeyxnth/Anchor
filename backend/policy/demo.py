@@ -22,7 +22,7 @@ from features import load_events  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from compliance import verify_against_dataset  # noqa: E402
 from pipeline import decide_for_row, load_model  # noqa: E402
-from agent import RuleBasedFallbackProvider  # noqa: E402
+from agent import get_provider  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
@@ -47,10 +47,16 @@ def main():
     print(f"\n{'=' * 70}\nLoading trained model: ml/artifacts/xgb_recovery_model.joblib\n{'=' * 70}")
     model = load_model()
 
-    provider = RuleBasedFallbackProvider()  # no API key configured in this environment — see policy/agent.py
-    print(f"LLM provider in use: {provider.name}  "
-          f"(no GEMINI_API_KEY/GROQ_API_KEY set — wire one up via env vars to use a real LLM; "
-          f"see policy/agent.py get_provider())")
+    # Provider is env-driven and auto-detected (Gemini > Groq > rule-based
+    # fallback — see agent.get_provider()). Wrapped in ResilientProvider by
+    # default: if the real LLM call fails (network hiccup, rate limit,
+    # malformed response), it degrades to RuleBasedFallbackProvider for that
+    # one decision rather than crashing the demo, and the returned
+    # AgentDecision.provider still honestly reports which path actually ran.
+    provider = get_provider()
+    underlying = getattr(provider, "primary", provider)
+    print(f"LLM provider in use: {underlying.name}  "
+          f"(resilient={'yes, falls back to rule_based_fallback on API failure' if underlying is not provider else 'no (rule_based_fallback has nothing to fall back to)'})")
 
     for txn_id in DEMO_TXN_IDS:
         row = events_df.loc[events_df["transaction_id"] == txn_id].iloc[0]

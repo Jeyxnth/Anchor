@@ -78,8 +78,8 @@
   ],
   "agent_decision": {
     "action": "retry_link",
-    "reason": "Highest expected value (Rs 509.95) among 5 allowed candidate(s); predicted recovery probability 35.0% on Rs 1461.83 at risk.",
-    "provider": "rule_based_fallback",
+    "reason": "retry_link has the highest expected value of 509.95 with a solid predicted probability of 0.3502 and minimal intervention cost.",
+    "provider": "gemini",
     "valid": true,
     "validation_note": null
   }
