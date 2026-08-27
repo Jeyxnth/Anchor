@@ -179,7 +179,7 @@ class GeminiProvider(LLMProvider):
     Studio docs before relying on this id; it has not been verified live here."""
     name = "gemini"
 
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None, fallback_model: Optional[str] = None):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         # gemini-2.0-flash-lite 404'd against a live key on 2026-08-26. So did
         # gemini-2.5-flash-lite and gemini-2.5-flash: Google's error body
@@ -193,16 +193,20 @@ class GeminiProvider(LLMProvider):
         # mid-demo; re-verify with GET /v1beta/models before relying on this
         # if it's been a while.
         self.model = model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        # Google has shipped several Flash-Lite generations in quick succession
+        # this year — real risk the pinned model above gets cut again before
+        # the demo. fallback_model defaults to the rolling "-latest" alias
+        # specifically because it's immune to exactly this failure mode (it's
+        # Google's job to keep it pointed at a live model, not ours to keep
+        # re-pinning). One retry only — see decide() below.
+        self.fallback_model = fallback_model or os.environ.get("GEMINI_MODEL_FALLBACK", "gemini-flash-lite-latest")
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
 
-    def decide(self, decision_input: DecisionInput) -> AgentDecision:
+    def _call(self, model: str, decision_input: DecisionInput):
         import requests
 
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
-            f"?key={self.api_key}"
-        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
         payload = {
             "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
             "contents": [{"role": "user", "parts": [{"text": json.dumps(decision_input.to_prompt_payload())}]}],
@@ -212,8 +216,35 @@ class GeminiProvider(LLMProvider):
         resp.raise_for_status()
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return text
+
+    @staticmethod
+    def _is_model_not_found(exc: Exception) -> bool:
+        import requests
+        return (
+            isinstance(exc, requests.HTTPError)
+            and exc.response is not None
+            and exc.response.status_code == 404
+        )
+
+    def decide(self, decision_input: DecisionInput) -> AgentDecision:
+        try:
+            text = self._call(self.model, decision_input)
+            model_used = self.model
+        except Exception as exc:  # noqa: BLE001
+            if not self._is_model_not_found(exc) or self.model == self.fallback_model:
+                raise  # not a model-ID problem (or already on the fallback id) — let ResilientProvider handle it
+            # One retry against the fallback model id (see __init__ note) before
+            # giving up and letting ResilientProvider drop to rule_based_fallback.
+            text = self._call(self.fallback_model, decision_input)
+            model_used = self.fallback_model
+
         raw = _extract_json_object(text)
-        return validate_decision(raw, decision_input, self.name, text)
+        decision = validate_decision(raw, decision_input, self.name, text)
+        if model_used != self.model:
+            note = f"Primary model {self.model!r} unavailable (404); served by fallback model {model_used!r}."
+            decision.validation_note = f"{decision.validation_note} {note}" if decision.validation_note else note
+        return decision
 
 
 class GroqProvider(LLMProvider):

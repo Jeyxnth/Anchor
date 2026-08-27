@@ -6,12 +6,24 @@ ORM, since the schema is small, fixed, and query needs are simple aggregates.
 
 Schema note — honesty over completeness: several columns exist for fields the
 brief's audit spec (§12) requires but that this project hasn't built yet
-(the hard compliance GATE — build-order step 5 — and the execution/outcome
-simulators — step 6). Those columns are nullable and stay NULL until those
-steps exist; nothing here fabricates a gate decision or an outcome that
-didn't happen. Every row currently records real output through the DECIDE
-stage (model -> EV ranking -> compliance-ELIGIBILITY filter -> agent
-decision), which is everything that exists in the pipeline today.
+(the hard compliance GATE — build-order step 5). Those columns are nullable
+and stay NULL until that step exists; nothing here fabricates a gate
+decision that didn't happen. The execution + outcome simulator (step 6) IS
+wired in now (see app/outcome.py) — outcome_recovered etc. are populated for
+every row logged via batch.py.
+
+Key note: primary key is (transaction_id, policy_name), not transaction_id
+alone. Multiple policies (ai_agent / do_nothing / generic_reminder, for the
+baseline experiment — build-order step 8) log a result for the SAME
+transaction_id without clobbering each other; re-running the same policy
+over the same transaction still replaces that policy's prior row (upsert
+semantics), which is the intended "latest decision per (transaction,
+policy)" behavior.
+
+Migrated from the original transaction_id-only-PK schema via
+migrate_composite_key.py (one-time, already run against ledger.db;
+backfilled existing rows with policy_name='ai_agent'). This SCHEMA constant
+is what a fresh install gets directly.
 """
 
 from __future__ import annotations
@@ -23,7 +35,8 @@ DB_PATH = Path(__file__).resolve().parent / "ledger.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
-    transaction_id              TEXT PRIMARY KEY,
+    transaction_id              TEXT NOT NULL,
+    policy_name                 TEXT NOT NULL,    -- 'ai_agent' | 'do_nothing' | 'generic_reminder' | ...
     batch_id                    TEXT NOT NULL,
     customer_id                 TEXT NOT NULL,
 
@@ -33,20 +46,23 @@ CREATE TABLE IF NOT EXISTS decisions (
     amount                       REAL NOT NULL,
     input_event_json             TEXT NOT NULL,
 
-    -- ML prediction stage
+    -- ML prediction stage (empty dict '{}' for non-ML baseline policies, which don't consult the model)
     predicted_probabilities_json TEXT NOT NULL,   -- {action: P(recovery)} for ALL actions, unfiltered
 
-    -- EV policy stage
+    -- EV policy stage (empty list '[]' for baseline policies — no EV ranking involved)
     candidates_ev_ranked_json    TEXT NOT NULL,    -- eligibility-filtered, EV-sorted candidate list
 
-    -- compliance ELIGIBILITY filter (pre-LLM candidate restriction; policy/compliance.py)
+    -- compliance ELIGIBILITY filter (pre-LLM candidate restriction; policy/compliance.py) —
+    -- computed identically for every policy, including baselines, since compliance never bends
     eligible_actions_json        TEXT NOT NULL,
     compliance_state_json        TEXT NOT NULL,    -- {opted_out, attempts_so_far_24h, last_contact_time}
 
-    -- AI decision agent stage
-    selected_action               TEXT NOT NULL,    -- agent's chosen action, pre-gate
+    -- decision stage (AI agent for policy_name='ai_agent'; a fixed rule for baseline policies —
+    -- agent_provider distinguishes which: 'gemini' | 'groq' | 'rule_based_fallback' |
+    -- 'baseline_do_nothing' | 'baseline_generic_reminder')
+    selected_action               TEXT NOT NULL,    -- chosen action, pre-gate
     agent_reason                  TEXT NOT NULL,
-    agent_provider                 TEXT NOT NULL,    -- 'gemini' | 'groq' | 'rule_based_fallback'
+    agent_provider                 TEXT NOT NULL,
     agent_valid                    INTEGER NOT NULL,  -- 1 = action was in allowed list as-returned; 0 = corrected
     agent_validation_note          TEXT,
 
@@ -55,21 +71,26 @@ CREATE TABLE IF NOT EXISTS decisions (
     gate_reason                    TEXT,
     final_action                   TEXT,             -- future: action actually authorized to execute
 
-    -- execution + outcome simulators (build-order step 6 — NOT IMPLEMENTED YET; always NULL today)
-    executed_action                 TEXT,
-    outcome_recovered               INTEGER,          -- future: 0/1
-    outcome_recovered_amount        REAL,
-    time_to_recovery_hours          REAL,
-    stopping_reason                 TEXT,
+    -- execution + outcome simulator (app/outcome.py) — sampled against ground_truth.csv's true
+    -- probability for whichever action was selected, same functional form as generate_data.py
+    executed_action                 TEXT NOT NULL,    -- = selected_action today (no gate to override it yet)
+    outcome_recovered               INTEGER NOT NULL, -- 0/1
+    outcome_recovered_amount        REAL NOT NULL,
+    time_to_recovery_hours          REAL,             -- NULL if not recovered
+    stopping_reason                 TEXT NOT NULL,    -- 'recovered' | 'not_recovered' today (see outcome.py)
 
     -- timestamps
-    created_at                      TEXT NOT NULL      -- ISO 8601, when this row was written
+    created_at                      TEXT NOT NULL,     -- ISO 8601, when this row was written
+
+    PRIMARY KEY (transaction_id, policy_name)
 );
 """
 
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_decisions_batch ON decisions(batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_decisions_policy ON decisions(policy_name)",
     "CREATE INDEX IF NOT EXISTS idx_decisions_action ON decisions(selected_action)",
+    "CREATE INDEX IF NOT EXISTS idx_decisions_txn ON decisions(transaction_id)",
 ]
 
 

@@ -3,17 +3,20 @@ FastAPI backend — brief §16/§17. Exposes the audit ledger and dashboard
 metrics over HTTP so the React dashboard (frontend/) has something to call.
 
 Endpoints implemented now:
-    POST /batch/run             run the pipeline over N events.csv rows, log to ledger
-    GET  /batch/{batch_id}      all traces for one batch
-    GET  /audit/{transaction_id} full decision trace for one case
-    GET  /metrics                dashboard-facing aggregate metrics (optional ?batch_id=)
-    POST /recover/{transaction_id}  run the live pipeline for one case (real LLM
-                                      provider by default) and log it
+    POST /batch/run                   run one policy over N events.csv rows, log to ledger
+    POST /batch/baseline_experiment   run all 3 policies (ai_agent/do_nothing/generic_reminder)
+                                        over the same N rows under one batch_id (build-order step 8)
+    GET  /batch/{batch_id}            all traces for one batch (optional ?policy_name=)
+    GET  /batch/{batch_id}/compare    side-by-side policy comparison for one batch_id
+    GET  /audit/{transaction_id}      full decision trace for one case (optional ?policy_name=)
+    GET  /metrics                     dashboard-facing aggregate metrics (optional ?batch_id=&policy_name=)
+    POST /recover/{transaction_id}    run the live pipeline for one case (real LLM
+                                        provider by default), simulate its outcome, and log it
 
 Not implemented yet (things they'd depend on don't exist): POST /events
 (ingestion — no separate risk-prioritization stage exists yet, the batch
-runner reads events.csv directly), and anything gate/execution/outcome-
-shaped (build-order steps 5-6).
+runner reads events.csv directly), and anything gate-shaped (build-order
+step 5 — the hard compliance gate with override authority).
 """
 
 from __future__ import annotations
@@ -35,8 +38,10 @@ from agent import get_provider  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from db import get_connection, init_db  # noqa: E402
-from ledger import compute_metrics, get_trace, list_batch, record_decision_trace  # noqa: E402
+from ledger import compare_policies, compute_metrics, get_trace, list_batch, record_decision_trace  # noqa: E402
 from batch import run_batch as _run_batch  # noqa: E402
+from batch import run_baseline_experiment as _run_baseline_experiment  # noqa: E402
+from outcome import load_ground_truth, new_rng, simulate_outcome  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
@@ -79,6 +84,12 @@ class BatchRunRequest(BaseModel):
     batch_id: Optional[str] = None
 
 
+class BaselineExperimentRequest(BaseModel):
+    n: Optional[int] = None
+    use_real_llm: bool = False
+    batch_id: Optional[str] = None
+
+
 @app.post("/batch/run")
 def batch_run(req: BatchRunRequest):
     provider = get_provider() if req.use_real_llm else None  # None -> batch.py's own fallback default
@@ -86,30 +97,50 @@ def batch_run(req: BatchRunRequest):
     return summary
 
 
+@app.post("/batch/baseline_experiment")
+def baseline_experiment(req: BaselineExperimentRequest):
+    provider = get_provider() if req.use_real_llm else None
+    return _run_baseline_experiment(n=req.n, batch_id=req.batch_id, provider=provider)
+
+
 @app.get("/batch/{batch_id}")
-def batch_results(batch_id: str):
+def batch_results(batch_id: str, policy_name: Optional[str] = None):
     conn = get_connection()
-    traces = list_batch(conn, batch_id)
+    traces = list_batch(conn, batch_id, policy_name=policy_name)
     conn.close()
     if not traces:
         raise HTTPException(status_code=404, detail=f"No decisions found for batch_id={batch_id!r}")
-    return {"batch_id": batch_id, "n_cases": len(traces), "decisions": traces}
+    return {"batch_id": batch_id, "policy_name": policy_name, "n_cases": len(traces), "decisions": traces}
+
+
+@app.get("/batch/{batch_id}/compare")
+def batch_compare(batch_id: str):
+    conn = get_connection()
+    result = compare_policies(conn, batch_id)
+    conn.close()
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 @app.get("/audit/{transaction_id}")
-def audit_trace(transaction_id: str):
+def audit_trace(transaction_id: str, policy_name: Optional[str] = None):
     conn = get_connection()
-    trace = get_trace(conn, transaction_id)
+    trace = get_trace(conn, transaction_id, policy_name=policy_name)
     conn.close()
     if trace is None:
-        raise HTTPException(status_code=404, detail=f"No decision logged for transaction_id={transaction_id!r}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No decision logged for transaction_id={transaction_id!r}"
+                   + (f", policy_name={policy_name!r}" if policy_name else ""),
+        )
     return trace
 
 
 @app.get("/metrics")
-def metrics(batch_id: Optional[str] = None):
+def metrics(batch_id: Optional[str] = None, policy_name: Optional[str] = None):
     conn = get_connection()
-    m = compute_metrics(conn, batch_id=batch_id)
+    m = compute_metrics(conn, batch_id=batch_id, policy_name=policy_name)
     conn.close()
     return m
 
@@ -119,7 +150,8 @@ def recover(transaction_id: str, batch_id: str = "live"):
     """Runs the live DECIDE pipeline for one transaction_id from events.csv,
     using the real auto-detected LLM provider (get_provider(), resilient
     fallback included) — unlike /batch/run, which defaults to the
-    deterministic provider for cost/speed reasons."""
+    deterministic provider for cost/speed reasons. Simulates and logs the
+    outcome too, under policy_name='ai_agent', same as a batch run."""
     events_df = get_events_df()
     matches = events_df.loc[events_df["transaction_id"] == transaction_id]
     if matches.empty:
@@ -128,11 +160,17 @@ def recover(transaction_id: str, batch_id: str = "live"):
 
     trace = decide_for_row(get_model(), row, provider=get_provider())
 
+    ground_truth = load_ground_truth()
+    rng = new_rng()  # a fresh seeded RNG per call — see outcome.py; a single live case doesn't
+                      # need the cross-policy alignment a batch run cares about
+    true_prob = ground_truth[transaction_id][trace["agent_decision"]["action"]]
+    outcome = simulate_outcome(rng, true_prob, row["amount"])
+
     conn = get_connection()
-    record_decision_trace(conn, batch_id, row, trace)
+    record_decision_trace(conn, batch_id, "ai_agent", row, trace, outcome)
     conn.commit()
     conn.close()
-    return trace
+    return {**trace, "outcome": outcome}
 
 
 @app.get("/health")

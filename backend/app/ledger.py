@@ -1,8 +1,10 @@
 """
 Audit ledger read/write functions — the persistence half of build-order
-step 7. Writes one row per decided transaction into the `decisions` table
-(schema in db.py); reads back either a single full trace (GET /audit/{id})
-or aggregate dashboard metrics (GET /metrics).
+step 7. Writes one row per (transaction, policy) decision into the
+`decisions` table (schema in db.py); reads back a single full trace
+(GET /audit/{id}), aggregate dashboard metrics (GET /metrics), or a
+side-by-side policy comparison for the baseline experiment (build-order
+step 8 — do_nothing / generic_reminder / ai_agent).
 """
 
 from __future__ import annotations
@@ -15,15 +17,20 @@ from typing import Optional
 import pandas as pd
 
 
-def record_decision_trace(conn: sqlite3.Connection, batch_id: str, row: pd.Series, trace: dict) -> None:
-    """Persist one policy/pipeline.py decide_for_row() trace. `row` is the
-    source events.csv row (for fields the trace doesn't carry, e.g. amount
-    as a plain float for SQL aggregation without JSON parsing)."""
+def record_decision_trace(conn: sqlite3.Connection, batch_id: str, policy_name: str,
+                           row: pd.Series, trace: dict, outcome: dict) -> None:
+    """Persist one decision + its simulated outcome. `row` is the source
+    events.csv row; `trace` matches policy/pipeline.py's decide_for_row()
+    shape (predicted_probabilities/candidates/eligible_actions/agent_decision
+    keys — baseline policies build an equivalent dict without a real model,
+    see batch.py); `outcome` is app/outcome.py's simulate_outcome() result.
+    executed_action = trace's selected action, since there's no hard gate
+    yet (step 5) to override it."""
     d = trace["agent_decision"]
     conn.execute(
         """
         INSERT OR REPLACE INTO decisions (
-            transaction_id, batch_id, customer_id,
+            transaction_id, policy_name, batch_id, customer_id,
             event_type, failure_reason, amount, input_event_json,
             predicted_probabilities_json,
             candidates_ev_ranked_json,
@@ -33,10 +40,10 @@ def record_decision_trace(conn: sqlite3.Connection, batch_id: str, row: pd.Serie
             executed_action, outcome_recovered, outcome_recovered_amount,
             time_to_recovery_hours, stopping_reason,
             created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            trace["transaction_id"], batch_id, str(row["customer_id"]),
+            trace["transaction_id"], policy_name, batch_id, str(row["customer_id"]),
             row["event_type"], row["failure_reason"], float(row["amount"]),
             json.dumps({**trace["customer_context"], **trace["transaction_context"]}, default=str),
             json.dumps(trace["predicted_probabilities_all_actions"]),
@@ -44,14 +51,28 @@ def record_decision_trace(conn: sqlite3.Connection, batch_id: str, row: pd.Serie
             json.dumps(trace["eligible_actions"]), json.dumps(trace["compliance_state"], default=str),
             d["action"], d["reason"], d["provider"], int(bool(d["valid"])), d["validation_note"],
             None, None, None,  # gate_status, gate_reason, final_action — step 5, not built
-            None, None, None, None, None,  # execution/outcome/stopping_reason — step 6, not built
+            d["action"],  # executed_action
+            int(outcome["recovered"]), outcome["recovered_amount"],
+            outcome["time_to_recovery_hours"], outcome["stopping_reason"],
             datetime.now(timezone.utc).isoformat(),
         ),
     )
 
 
-def get_trace(conn: sqlite3.Connection, transaction_id: str) -> Optional[dict]:
-    row = conn.execute("SELECT * FROM decisions WHERE transaction_id = ?", (transaction_id,)).fetchone()
+def get_trace(conn: sqlite3.Connection, transaction_id: str, policy_name: Optional[str] = None) -> Optional[dict]:
+    """policy_name=None resolves to 'ai_agent' if present, else whichever
+    policy happens to have a row for this transaction — the single-trace
+    audit view is inherently about "the" decision for a case, and ai_agent
+    is the one with real agent reasoning to show."""
+    if policy_name is not None:
+        row = conn.execute(
+            "SELECT * FROM decisions WHERE transaction_id = ? AND policy_name = ?", (transaction_id, policy_name)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM decisions WHERE transaction_id = ? ORDER BY (policy_name = 'ai_agent') DESC LIMIT 1",
+            (transaction_id,),
+        ).fetchone()
     if row is None:
         return None
     r = dict(row)
@@ -59,52 +80,106 @@ def get_trace(conn: sqlite3.Connection, transaction_id: str) -> Optional[dict]:
                       "eligible_actions_json", "compliance_state_json"):
         r[json_col.removesuffix("_json")] = json.loads(r.pop(json_col))
     r["agent_valid"] = bool(r["agent_valid"])
+    r["outcome_recovered"] = bool(r["outcome_recovered"])
     return r
 
 
-def list_batch(conn: sqlite3.Connection, batch_id: str) -> list[dict]:
-    rows = conn.execute("SELECT transaction_id FROM decisions WHERE batch_id = ?", (batch_id,)).fetchall()
-    return [get_trace(conn, r["transaction_id"]) for r in rows]
+def list_batch(conn: sqlite3.Connection, batch_id: str, policy_name: Optional[str] = None) -> list[dict]:
+    if policy_name:
+        rows = conn.execute(
+            "SELECT transaction_id, policy_name FROM decisions WHERE batch_id = ? AND policy_name = ?",
+            (batch_id, policy_name),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT transaction_id, policy_name FROM decisions WHERE batch_id = ?", (batch_id,)
+        ).fetchall()
+    return [get_trace(conn, r["transaction_id"], r["policy_name"]) for r in rows]
 
 
-def compute_metrics(conn: sqlite3.Connection, batch_id: Optional[str] = None) -> dict:
-    """Dashboard-facing aggregate metrics (GET /metrics, brief §13). Fields
-    that depend on the not-yet-built hard gate / execution / outcome
-    simulators are reported as null with an explicit `pending` note rather
-    than a fabricated number — see db.py's schema docstring."""
-    where = "WHERE batch_id = ?" if batch_id else ""
-    params = (batch_id,) if batch_id else ()
+def _where_clause(batch_id: Optional[str], policy_name: Optional[str]) -> tuple[str, tuple]:
+    clauses, params = [], []
+    if batch_id:
+        clauses.append("batch_id = ?")
+        params.append(batch_id)
+    if policy_name:
+        clauses.append("policy_name = ?")
+        params.append(policy_name)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return where, tuple(params)
+
+
+def compute_metrics(conn: sqlite3.Connection, batch_id: Optional[str] = None,
+                     policy_name: Optional[str] = None) -> dict:
+    """Dashboard-facing aggregate metrics (GET /metrics, brief §13) for one
+    policy (default: whatever's in the ledger if policy_name is omitted —
+    pass policy_name explicitly once multiple policies share a batch_id, or
+    use compare_policies() for the side-by-side view). revenue_recovered /
+    recovery_rate are real now (app/outcome.py); incremental_recovery is
+    left to compare_policies(), which has the other policies' numbers to
+    diff against. quiet_hour_violations still depends on the hard gate
+    (step 5, not built) and stays null."""
+    where, params = _where_clause(batch_id, policy_name)
+
+    policy_warning = None
+    if not policy_name:
+        distinct_policies = [r["policy_name"] for r in conn.execute(
+            f"SELECT DISTINCT policy_name FROM decisions {where}", params
+        )]
+        if len(distinct_policies) > 1:
+            policy_warning = (
+                f"No policy_name filter given and this selection spans {len(distinct_policies)} "
+                f"policies {distinct_policies} — every number below sums/averages across ALL of "
+                f"them (e.g. the same transaction counted once per policy), which is not a "
+                f"meaningful business metric. Pass policy_name explicitly (usually 'ai_agent' for "
+                f"the live dashboard), or use GET /batch/{{batch_id}}/compare for a correct "
+                f"side-by-side view."
+            )
 
     total_row = conn.execute(
-        f"SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total_amount FROM decisions {where}", params
+        f"""SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total_amount,
+                   COALESCE(SUM(outcome_recovered_amount), 0) AS total_recovered,
+                   COALESCE(SUM(outcome_recovered), 0) AS n_recovered
+            FROM decisions {where}""",
+        params,
     ).fetchone()
-    n_cases, revenue_at_risk = total_row["n"], total_row["total_amount"]
+    n_cases = total_row["n"]
+    revenue_at_risk = total_row["total_amount"]
+    revenue_recovered = total_row["total_recovered"]
+    recovery_rate = (total_row["n_recovered"] / n_cases) if n_cases else None
 
     # Computed in Python rather than SQL: predicted_probability of the
     # SELECTED action isn't always candidates[0] (the agent can deviate from
     # top-EV), so it has to be looked up by action name per row.
     recovery_by_intervention = {}
-    for r in conn.execute(f"SELECT selected_action, predicted_probabilities_json, amount FROM decisions {where}", params):
+    for r in conn.execute(
+        f"SELECT selected_action, predicted_probabilities_json, amount, outcome_recovered, "
+        f"outcome_recovered_amount FROM decisions {where}", params
+    ):
         probs = json.loads(r["predicted_probabilities_json"])
         action = r["selected_action"]
         bucket = recovery_by_intervention.setdefault(
-            action, {"n_selected": 0, "amount_at_risk": 0.0, "predicted_probabilities": []}
+            action, {"n_selected": 0, "amount_at_risk": 0.0, "amount_recovered": 0.0,
+                     "n_recovered": 0, "predicted_probabilities": []}
         )
         bucket["n_selected"] += 1
         bucket["amount_at_risk"] += r["amount"]
+        bucket["amount_recovered"] += r["outcome_recovered_amount"]
+        bucket["n_recovered"] += r["outcome_recovered"]
         bucket["predicted_probabilities"].append(probs.get(action, 0.0))
     for action, bucket in recovery_by_intervention.items():
         probs = bucket.pop("predicted_probabilities")
         bucket["mean_predicted_recovery_probability"] = round(sum(probs) / len(probs), 4) if probs else None
         bucket["amount_at_risk"] = round(bucket["amount_at_risk"], 2)
+        bucket["amount_recovered"] = round(bucket["amount_recovered"], 2)
+        bucket["recovery_rate"] = round(bucket["n_recovered"] / bucket["n_selected"], 4) if bucket["n_selected"] else None
 
     provider_counts = conn.execute(
         f"SELECT agent_provider, COUNT(*) AS n FROM decisions {where} GROUP BY agent_provider", params
     ).fetchall()
 
-    invalid_count = conn.execute(
-        f"SELECT COUNT(*) AS n FROM decisions {where}{' AND' if where else 'WHERE'} agent_valid = 0", params
-    ).fetchone()["n"]
+    invalid_where = where + (" AND" if where else "WHERE") + " agent_valid = 0"
+    invalid_count = conn.execute(f"SELECT COUNT(*) AS n FROM decisions {invalid_where}", params).fetchone()["n"]
 
     compliance_restricted = 0
     opted_out = 0
@@ -119,18 +194,23 @@ def compute_metrics(conn: sqlite3.Connection, batch_id: Optional[str] = None) ->
         elif len(eligible) < 5:
             contact_capped += 1
 
+    stopping_reasons = conn.execute(
+        f"SELECT stopping_reason, COUNT(*) AS n FROM decisions {where} GROUP BY stopping_reason", params
+    ).fetchall()
+
     return {
         "batch_id": batch_id,
+        "policy_name": policy_name,
+        "_policy_warning": policy_warning,
         "n_cases": n_cases,
         "revenue_at_risk": round(revenue_at_risk, 2),
-        "revenue_recovered": None,
-        "recovery_rate": None,
+        "revenue_recovered": round(revenue_recovered, 2) if n_cases else None,
+        "recovery_rate": round(recovery_rate, 4) if recovery_rate is not None else None,
         "incremental_recovery_vs_baseline": None,
         "_pending_note": (
-            "revenue_recovered / recovery_rate / incremental_recovery_vs_baseline are null: "
-            "they require the outcome simulator (build-order step 6) and baseline experiment "
-            "(step 8), neither implemented yet. What's shown below is everything real through "
-            "the DECIDE stage: predicted recovery probabilities and EV-ranked action selection."
+            "incremental_recovery_vs_baseline is null here: it needs another policy's numbers to "
+            "diff against, which single-policy compute_metrics() doesn't have — use GET "
+            "/batch/{batch_id}/compare for the side-by-side baseline comparison (build-order step 8)."
         ),
         "recovery_by_intervention": recovery_by_intervention,
         "compliance": {
@@ -146,5 +226,56 @@ def compute_metrics(conn: sqlite3.Connection, batch_id: Optional[str] = None) ->
         },
         "agent_provider_breakdown": {r["agent_provider"]: r["n"] for r in provider_counts},
         "agent_decisions_corrected_by_validator": invalid_count,
-        "stopping_reason_breakdown": None,  # pending step 6
+        "stopping_reason_breakdown": {r["stopping_reason"]: r["n"] for r in stopping_reasons},
+    }
+
+
+def compare_policies(conn: sqlite3.Connection, batch_id: str) -> dict:
+    """Side-by-side baseline comparison (build-order step 8) across every
+    policy_name logged under one batch_id. Requires all policies to have run
+    over the SAME transaction set to be a fair comparison — this checks that
+    and reports it rather than silently comparing mismatched populations."""
+    policy_rows = conn.execute(
+        "SELECT DISTINCT policy_name FROM decisions WHERE batch_id = ?", (batch_id,)
+    ).fetchall()
+    policy_names = [r["policy_name"] for r in policy_rows]
+    if not policy_names:
+        return {"batch_id": batch_id, "error": f"no decisions found for batch_id={batch_id!r}"}
+
+    txn_sets = {
+        p: {r["transaction_id"] for r in conn.execute(
+            "SELECT transaction_id FROM decisions WHERE batch_id = ? AND policy_name = ?", (batch_id, p)
+        )}
+        for p in policy_names
+    }
+    same_population = len(set(frozenset(s) for s in txn_sets.values())) == 1
+
+    per_policy = {p: compute_metrics(conn, batch_id=batch_id, policy_name=p) for p in policy_names}
+    agent_recovered = per_policy.get("ai_agent", {}).get("revenue_recovered")
+
+    def incremental_vs_agent(baseline_name: str, baseline_recovered) -> Optional[float]:
+        if baseline_name == "ai_agent" or agent_recovered is None or baseline_recovered is None:
+            return None
+        return round(agent_recovered - baseline_recovered, 2)
+
+    results = {
+        p: {
+            "revenue_recovered": m["revenue_recovered"],
+            "recovery_rate": m["recovery_rate"],
+            "incremental_recovery_vs_ai_agent": incremental_vs_agent(p, m["revenue_recovered"]),
+        }
+        for p, m in per_policy.items()
+    }
+    incremental_summary = {
+        p: r["incremental_recovery_vs_ai_agent"] for p, r in results.items() if r["incremental_recovery_vs_ai_agent"] is not None
+    }
+
+    return {
+        "batch_id": batch_id,
+        "policies_compared": policy_names,
+        "same_transaction_population_across_policies": same_population,
+        "n_cases_per_policy": {p: len(s) for p, s in txn_sets.items()},
+        "revenue_at_risk": next(iter(per_policy.values()))["revenue_at_risk"] if per_policy else None,
+        "results": results,
+        "incremental_recovery_of_ai_agent_vs_each_baseline": incremental_summary or None,
     }
