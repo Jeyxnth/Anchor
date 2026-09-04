@@ -11,10 +11,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ml"))
+from features import ALL_INTERVENTIONS  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "policy"))
+from ev import rank_candidates  # noqa: E402
 
 
 def record_decision_trace(conn: sqlite3.Connection, batch_id: str, policy_name: str,
@@ -81,6 +89,25 @@ def get_trace(conn: sqlite3.Connection, transaction_id: str, policy_name: Option
         r[json_col.removesuffix("_json")] = json.loads(r.pop(json_col))
     r["agent_valid"] = bool(r["agent_valid"])
     r["outcome_recovered"] = bool(r["outcome_recovered"])
+
+    # Unconstrained EV ranking — what would have been picked with NO compliance
+    # filtering — derived at read time from data already stored (predicted_probabilities
+    # covers all 5 actions regardless of eligibility; no new column needed). Only
+    # meaningful for policies that actually consult the model (ai_agent); baseline
+    # policies log an empty predicted_probabilities dict and get an empty list back.
+    # Makes the compliance effect a visible before/after rather than implicit —
+    # identical to candidates_ev_ranked when eligible_actions already covers all 5.
+    if r["predicted_probabilities"]:
+        unconstrained = rank_candidates(r["predicted_probabilities"], recoverable_amount=r["amount"],
+                                         eligible=list(ALL_INTERVENTIONS))
+        r["candidates_ev_ranked_unconstrained"] = [c.as_dict() for c in unconstrained]
+        r["unconstrained_top_action"] = unconstrained[0].action
+        r["compliance_changed_top_action"] = unconstrained[0].action != r["selected_action"]
+    else:
+        r["candidates_ev_ranked_unconstrained"] = []
+        r["unconstrained_top_action"] = None
+        r["compliance_changed_top_action"] = None
+
     return r
 
 
@@ -146,7 +173,13 @@ def compute_metrics(conn: sqlite3.Connection, batch_id: Optional[str] = None,
     n_cases = total_row["n"]
     revenue_at_risk = total_row["total_amount"]
     revenue_recovered = total_row["total_recovered"]
-    recovery_rate = (total_row["n_recovered"] / n_cases) if n_cases else None
+    # Two genuinely different ratios, deliberately both exposed and labeled —
+    # see the "recovery_rate_definitions" note below. They will NOT match
+    # numerically (e.g. 49.65% vs 50.11% on the full batch): that's not a
+    # bug, it's because recovered transactions and their amounts aren't
+    # uniformly distributed relative to unrecovered ones.
+    recovery_rate = (total_row["n_recovered"] / n_cases) if n_cases else None                    # count-based
+    revenue_weighted_recovery_rate = (revenue_recovered / revenue_at_risk) if revenue_at_risk else None  # rupee-weighted
 
     # Computed in Python rather than SQL: predicted_probability of the
     # SELECTED action isn't always candidates[0] (the agent can deviate from
@@ -206,6 +239,17 @@ def compute_metrics(conn: sqlite3.Connection, batch_id: Optional[str] = None,
         "revenue_at_risk": round(revenue_at_risk, 2),
         "revenue_recovered": round(revenue_recovered, 2) if n_cases else None,
         "recovery_rate": round(recovery_rate, 4) if recovery_rate is not None else None,
+        "revenue_weighted_recovery_rate": (
+            round(revenue_weighted_recovery_rate, 4) if revenue_weighted_recovery_rate is not None else None
+        ),
+        "recovery_rate_definitions": {
+            "recovery_rate": "count-based: recovered transactions / total transactions.",
+            "revenue_weighted_recovery_rate": "rupee-based: revenue_recovered / revenue_at_risk.",
+            "_note": "These will NOT numerically match (recovered transactions skew toward "
+                     "different amounts than unrecovered ones) — that's expected, not an "
+                     "inconsistency. 'Recovery Rate' in the dashboard is the count-based figure "
+                     "unless labeled otherwise.",
+        },
         "incremental_recovery_vs_baseline": None,
         "_pending_note": (
             "incremental_recovery_vs_baseline is null here: it needs another policy's numbers to "
@@ -261,7 +305,8 @@ def compare_policies(conn: sqlite3.Connection, batch_id: str) -> dict:
     results = {
         p: {
             "revenue_recovered": m["revenue_recovered"],
-            "recovery_rate": m["recovery_rate"],
+            "recovery_rate": m["recovery_rate"],                                   # count-based — see recovery_rate_definitions
+            "revenue_weighted_recovery_rate": m["revenue_weighted_recovery_rate"],  # rupee-based
             "incremental_recovery_vs_ai_agent": incremental_vs_agent(p, m["revenue_recovered"]),
         }
         for p, m in per_policy.items()
@@ -276,6 +321,7 @@ def compare_policies(conn: sqlite3.Connection, batch_id: str) -> dict:
         "same_transaction_population_across_policies": same_population,
         "n_cases_per_policy": {p: len(s) for p, s in txn_sets.items()},
         "revenue_at_risk": next(iter(per_policy.values()))["revenue_at_risk"] if per_policy else None,
+        "recovery_rate_definitions": next(iter(per_policy.values()))["recovery_rate_definitions"] if per_policy else None,
         "results": results,
         "incremental_recovery_of_ai_agent_vs_each_baseline": incremental_summary or None,
     }

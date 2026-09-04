@@ -78,7 +78,7 @@
   ],
   "agent_decision": {
     "action": "retry_link",
-    "reason": "retry_link has the highest expected value of 509.95 with a solid predicted probability of 0.3502 and minimal intervention cost.",
+    "reason": "retry_link has the highest expected_value of 509.95 with a solid predicted recovery probability of 0.3502 and minimal intervention cost.",
     "provider": "gemini",
     "valid": true,
     "validation_note": null
