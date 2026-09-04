@@ -23,6 +23,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ n, use_real_llm: useRealLlm }),
     }),
+  runBaselineExperiment: (n, useRealLlm, batchId) =>
+    request("/batch/baseline_experiment", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ n, use_real_llm: useRealLlm, batch_id: batchId }),
+    }),
   // Default policyName to "ai_agent": since the composite (transaction_id, policy_name)
   // ledger key, a batch_id can hold multiple policies (baseline experiment runs
   // do_nothing/generic_reminder under the same batch_id) — this dashboard shows the

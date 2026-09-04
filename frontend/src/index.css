@@ -1,15 +1,33 @@
+@import "tailwindcss";
+
+/* Light theme, dark sidebar — see App.css header comment. Kept the .dark
+   custom-variant plumbing even though nothing here uses Tailwind's dark:
+   variant anymore (no Aceternity components remain) — harmless to leave,
+   cheap to keep in case a future component needs it. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  color-scheme: dark;
-  --bg: #0b0f14;
-  --surface: #121821;
-  --surface-2: #1a2230;
-  --border: #263142;
-  --text: #e8edf4;
-  --text-muted: #8a97a8;
-  --accent: #35d0a1;
-  --accent-2: #4f8cff;
-  --warning: #f2b84b;
-  --danger: #ef6461;
+  color-scheme: light;
+
+  --sidebar: #0f172a;
+  --content-bg: #f5f7fa;
+  --card-bg: #ffffff;
+  --border: #e5e7eb;
+  --accent: #4f6ef7;
+  --success: #12b76a;
+  --danger: #f04438;
+  --warning: #f79009;
+  --text-muted: #6b7280;
+  --text-heading: #111827;
+
+  /* Categorical chart colors (donut segments / avatar tints) — distinct
+     from the semantic tokens above so a chart color is never mistaken for
+     a status meaning (green segment != "success", etc.). */
+  --chart-1: #4f6ef7;
+  --chart-2: #0ea5e9;
+  --chart-3: #f79009;
+  --chart-4: #7c3aed;
+  --chart-5: #94a3b8;
 
   font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
 }
@@ -18,12 +36,23 @@
   box-sizing: border-box;
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
+  background: var(--content-bg);
+  color: var(--text-heading);
 }
 
 button {
   cursor: pointer;
+  font-family: inherit;
+}
+
+.num {
+  font-family: "JetBrains Mono", "IBM Plex Mono", ui-monospace, "Cascadia Code", monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
 }
