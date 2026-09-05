@@ -6,7 +6,7 @@ action for each case, and executes it safely — enforcing compliance as
 code the agent cannot see around, not a prompt instruction it might
 ignore.
 
-[Watch the 7-minute demo](https://drive.google.com/file/d/1gqjJNG468bX9NqSvYSePrBCSYh2sVB1U/view?usp=drive_link)
+[Watch the 5-minute demo](https://drive.google.com/file/d/1gqjJNG468bX9NqSvYSePrBCSYh2sVB1U/view?usp=drive_link)
 
 ![Anchor architecture](frontend/_demo/anchor_architecture_diagram.png)
 
