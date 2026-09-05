@@ -77,9 +77,21 @@ const POLICY_LABELS = {
 const POLICY_ORDER = ["do_nothing", "generic_reminder", "ai_agent"];
 
 const DEMO_CASES = [
-  { id: "TXN000000", label: "Normal case", hint: "all 5 actions eligible" },
+  // TXN000000 was the original "normal case" pick, but quiet-hours (added
+  // 2026-09-05) collapses it to no_action-only at its time_of_day=0 — it no
+  // longer shows the escalate-vs-retry-link EV story. TXN000224 replicates
+  // that exact story (daytime, first contact, all 5 eligible, escalate_to_human
+  // highest predicted probability but losing to retry_link on EV) with real,
+  // re-verified numbers — see DEMO_SCRIPT.md Case 1.
+  { id: "TXN000224", label: "Normal case", hint: "all 5 actions eligible" },
   { id: "TXN000025", label: "Opted-out", hint: "compliance restricts to no_action only" },
-  { id: "TXN002166", label: "Contact-capped", hint: "compliance restricts to escalate/no_action" },
+  // TXN002166 is the ONLY row in the entire 4,000-row dataset with
+  // attempts_so_far >= 2 — and it happens to fall at time_of_day=3, so
+  // quiet-hours (checked first) now also independently forces no_action
+  // here. There is no other contact-capped row to swap in at any hour, so
+  // this case is kept and reframed as a stacked-restrictions example
+  // rather than an isolated contact-cap one — see DEMO_SCRIPT.md Case 3.
+  { id: "TXN002166", label: "Contact-capped", hint: "compliance restricts to no_action (stacked with quiet hours here)" },
 ];
 
 const NAV_ITEMS = [
@@ -102,10 +114,6 @@ function formatPct(fraction) {
 function formatDate(iso) {
   if (!iso) return "—";
   return new Date(iso).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
-}
-
-function PendingNote({ children }) {
-  return <span className="pending-note" title={children}>pending</span>;
 }
 
 function SectionHead({ children, subtitle, info }) {
@@ -264,6 +272,46 @@ function StoppingReasons({ breakdown }) {
   );
 }
 
+function RecoveryByIntervention({ data }) {
+  const entries = Object.entries(data || {}).sort((a, b) => b[1].n_selected - a[1].n_selected);
+
+  return (
+    <section className="card" id="recovery-by-intervention">
+      <SectionHead subtitle="Case count, ₹ at risk, and mean predicted recovery probability, per selected action.">
+        Recovery by Intervention
+      </SectionHead>
+      {entries.length === 0 ? (
+        <p className="muted">No decisions logged yet — run a batch above.</p>
+      ) : (
+        <div className="intervention-list">
+          <div className="intervention-row intervention-row--header" aria-hidden="true">
+            <span />
+            <span className="intervention-col-label">Action</span>
+            <span className="intervention-col-label intervention-col-label--right">Cases</span>
+            <span className="intervention-col-label intervention-col-label--right">₹ At Risk</span>
+            <span className="intervention-col-label intervention-col-label--right">Mean P(recover)</span>
+          </div>
+          {entries.map(([action, v]) => {
+            const Icon = ACTION_ICONS[action] || XLucide;
+            const tint = ACTION_COLORS[action] || "var(--chart-5)";
+            return (
+              <div className="intervention-row" key={action}>
+                <span className="intervention-icon" style={{ background: `color-mix(in srgb, ${tint} 16%, white)`, color: tint }}>
+                  <Icon size={16} />
+                </span>
+                <span className="intervention-name">{ACTION_LABELS[action] || action}</span>
+                <span className="intervention-value num">{v.n_selected}</span>
+                <span className="intervention-value num">{formatINR(v.amount_at_risk)}</span>
+                <span className="intervention-value num">{formatPct(v.mean_predicted_recovery_probability)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function CompliancePanel({ compliance, nCases, stoppingReasonBreakdown }) {
   if (!compliance) return null;
   const capBar = { value: compliance.contact_cap_restricted, max: Math.max(1, nCases) };
@@ -308,11 +356,14 @@ function CompliancePanel({ compliance, nCases, stoppingReasonBreakdown }) {
         </div>
         <div className="progress-row">
           <div className="progress-row-head">
-            <span>Quiet-hour violations</span>
-            <span>{compliance.quiet_hour_violations === null ? <PendingNote>{compliance._note}</PendingNote> : compliance.quiet_hour_violations}</span>
+            <span>Quiet-hour restricted</span>
+            <span className="num">{compliance.quiet_hour_restricted} / {capBar.max}</span>
           </div>
           <div className="progress-track">
-            <div className="progress-fill progress-fill--muted" style={{ width: "0%" }} />
+            <div
+              className="progress-fill progress-fill--warning"
+              style={{ width: `${(compliance.quiet_hour_restricted / capBar.max) * 100}%` }}
+            />
           </div>
         </div>
       </div>
@@ -334,8 +385,8 @@ function PolicyComparisonBlock({ comparison, loading, batchIdInput, onBatchIdInp
     <section className="card" id="policy-comparison">
       <div className="policy-head">
         <SectionHead
-          subtitle="Same transactions, three policies, real simulated outcomes."
-          info="Compares do_nothing, generic_reminder, and ai_agent by replaying the same transaction population under each policy so the result is apples-to-apples."
+          subtitle="Same transactions, three policies, real simulated outcomes. Always runs the full dataset, independent of the rows field above."
+          info="Compares do_nothing, generic_reminder, and ai_agent by replaying the same transaction population under each policy so the result is apples-to-apples. Always uses the full dataset (not the header's rows field, which only affects Run Batch) so the comparison is a stable, repeatable headline number."
         >
           Policy Comparison — Baseline Experiment
         </SectionHead>
@@ -790,7 +841,15 @@ export default function App() {
     setRunningBaseline(true);
     setError(null);
     try {
-      const result = await api.runBaselineExperiment(nRows || null, useRealLlm, null);
+      // Deliberately NOT nRows — that field lives in the header next to
+      // "Run Batch" (a quick ad-hoc single-policy tester) and has nothing
+      // visually to do with this button, which is in the Policy Comparison
+      // card further down. A baseline experiment is a same-population,
+      // three-policy comparison, so it always runs the full dataset
+      // (n=null -> "all rows in events.csv") regardless of whatever's left
+      // over in that unrelated field. See PROJECT_BRIEF/STATUS for the
+      // headline recovery numbers this produces at full scale.
+      const result = await api.runBaselineExperiment(null, useRealLlm, null);
       setBatchId(result.batch_id);
       setComparison(result.comparison);
       setCompareBatchIdInput(result.batch_id);
@@ -861,6 +920,8 @@ export default function App() {
             <PolicyComparisonBars comparison={comparison} />
           </section>
         </div>
+
+        <RecoveryByIntervention data={metrics?.recovery_by_intervention} />
 
         <CompliancePanel
           compliance={metrics?.compliance}

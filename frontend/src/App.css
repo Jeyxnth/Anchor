@@ -15,13 +15,6 @@
   font-size: 0.875rem;
 }
 
-.pending-note {
-  font-size: 0.8rem;
-  color: var(--warning);
-  border-bottom: 1px dotted var(--warning);
-  cursor: help;
-}
-
 /* ---- info tooltip: small "i" badge, detail on hover/focus ---- */
 
 .info-tip {
@@ -805,6 +798,73 @@
 .demo-card-hint {
   font-size: 0.875rem;
   color: var(--text-muted);
+}
+
+/* ---- recovery by intervention: fixed-column grid ----
+   Same fixed-template-columns technique as the Recent Decisions table below
+   (icon / name / three right-aligned stat columns), so a case count next to
+   a four-digit ₹ figure next to a percentage never drifts the columns out
+   of alignment. */
+
+.intervention-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.intervention-row {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 90px 130px 150px;
+  align-items: center;
+  column-gap: 14px;
+  padding: 13px 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.intervention-row:last-child {
+  border-bottom: none;
+}
+
+.intervention-row--header {
+  padding: 0 4px 10px;
+}
+
+.intervention-col-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.intervention-col-label--right {
+  text-align: right;
+}
+
+.intervention-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.intervention-name {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-heading);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.intervention-value {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-heading);
+  text-align: right;
 }
 
 /* ---- recent decisions: fixed-column grid ----
