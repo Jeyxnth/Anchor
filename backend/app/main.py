@@ -37,7 +37,7 @@ from pipeline import decide_for_row, load_model  # noqa: E402
 from agent import get_provider  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from db import get_connection, init_db  # noqa: E402
+from db import WRITE_LOCK, get_connection, init_db  # noqa: E402
 from ledger import compare_policies, compute_metrics, get_trace, list_batch, record_decision_trace  # noqa: E402
 from batch import run_batch as _run_batch  # noqa: E402
 from batch import run_baseline_experiment as _run_baseline_experiment  # noqa: E402
@@ -166,10 +166,11 @@ def recover(transaction_id: str, batch_id: str = "live"):
     true_prob = ground_truth[transaction_id][trace["agent_decision"]["action"]]
     outcome = simulate_outcome(rng, true_prob, row["amount"])
 
-    conn = get_connection()
-    record_decision_trace(conn, batch_id, "ai_agent", row, trace, outcome)
-    conn.commit()
-    conn.close()
+    with WRITE_LOCK:  # see the note on WRITE_LOCK in app/db.py
+        conn = get_connection()
+        record_decision_trace(conn, batch_id, "ai_agent", row, trace, outcome)
+        conn.commit()
+        conn.close()
     return {**trace, "outcome": outcome}
 
 

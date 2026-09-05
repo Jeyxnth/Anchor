@@ -23,6 +23,7 @@ from features import ALL_INTERVENTIONS  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "policy"))
 from ev import rank_candidates  # noqa: E402
+from compliance import is_quiet_hours  # noqa: E402
 
 
 def record_decision_trace(conn: sqlite3.Connection, batch_id: str, policy_name: str,
@@ -217,15 +218,41 @@ def compute_metrics(conn: sqlite3.Connection, batch_id: Optional[str] = None,
     compliance_restricted = 0
     opted_out = 0
     contact_capped = 0
-    for r in conn.execute(f"SELECT eligible_actions_json, compliance_state_json FROM decisions {where}", params):
+    quiet_hour_restricted = 0
+    for r in conn.execute(
+        f"SELECT eligible_actions_json, compliance_state_json, input_event_json FROM decisions {where}", params
+    ):
         eligible = json.loads(r["eligible_actions_json"])
         state = json.loads(r["compliance_state_json"])
         if len(eligible) < 5:
             compliance_restricted += 1
         if state.get("opted_out"):
             opted_out += 1
-        elif len(eligible) < 5:
-            contact_capped += 1
+        else:
+            # Mutually exclusive with contact_capped below: quiet hours
+            # (policy/compliance.py's is_quiet_hours(), checked ahead of
+            # the contact-cap rule there) forces no_action-only regardless
+            # of contact-cap state, so a case that's BOTH quiet-hours and
+            # contact-capped is attributed to quiet hours here — that's
+            # actually why its eligible set narrowed all the way down,
+            # not the contact cap alone. time_of_day isn't its own column
+            # (no schema change needed) — it's already in input_event_json
+            # (transaction_context), stored for every row since batch.py's
+            # first version.
+            #
+            # Checked against the ACTUAL stored eligible set (== ["no_action"]),
+            # not just "was it quiet hours", because a first-attempt
+            # payment_failed case is exempt from quiet-hours (see
+            # compliance.is_first_attempt_payment_failure()) — its eligible
+            # set won't have collapsed even though time_of_day says quiet
+            # hours. Deriving from eligible_actions_json directly avoids
+            # duplicating that exemption's logic here and risking drift.
+            time_of_day = json.loads(r["input_event_json"]).get("time_of_day")
+            quiet_hour_active = time_of_day is not None and is_quiet_hours(int(time_of_day))
+            if quiet_hour_active and eligible == ["no_action"]:
+                quiet_hour_restricted += 1
+            elif len(eligible) < 5:
+                contact_capped += 1
 
     stopping_reasons = conn.execute(
         f"SELECT stopping_reason, COUNT(*) AS n FROM decisions {where} GROUP BY stopping_reason", params
@@ -261,12 +288,15 @@ def compute_metrics(conn: sqlite3.Connection, batch_id: Optional[str] = None,
             "cases_with_restricted_eligibility": compliance_restricted,
             "opted_out_respected": opted_out,
             "contact_cap_restricted": contact_capped,
-            "quiet_hour_violations": None,   # hard gate not built (step 5)
+            "quiet_hour_restricted": quiet_hour_restricted,
             "target_compliance_violations": 0,
-            "_note": "quiet_hour_violations is null pending the hard compliance gate (step 5); "
-                     "opted_out_respected / contact_cap_restricted come from the eligibility "
-                     "filter that already exists (policy/compliance.py) and are 0 real violations "
-                     "by construction — the model is never even shown a disallowed action.",
+            "_note": "opted_out_respected / contact_cap_restricted / quiet_hour_restricted all "
+                     "come from the eligibility filter that already exists (policy/compliance.py) "
+                     "and are 0 real violations by construction — the model is never even shown a "
+                     "disallowed action. quiet_hour_restricted counts cases where time_of_day fell "
+                     "outside 9am-8pm and collapsed eligibility to no_action-only; a case that's "
+                     "both quiet-hours and contact-capped counts here, not in contact_cap_restricted, "
+                     "since quiet hours is why it narrowed all the way to no_action.",
         },
         "agent_provider_breakdown": {r["agent_provider"]: r["n"] for r in provider_counts},
         "agent_decisions_corrected_by_validator": invalid_count,

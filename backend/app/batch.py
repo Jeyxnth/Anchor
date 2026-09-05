@@ -37,7 +37,7 @@ from agent import RuleBasedFallbackProvider  # noqa: E402
 from compliance import eligible_actions, state_from_event_row  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from db import get_connection, init_db  # noqa: E402
+from db import WRITE_LOCK, get_connection, init_db  # noqa: E402
 from ledger import compare_policies, record_decision_trace  # noqa: E402
 from outcome import load_ground_truth, new_rng, simulate_outcome  # noqa: E402
 
@@ -96,21 +96,37 @@ def run_batch(n: Optional[int] = None, provider=None, batch_id: Optional[str] = 
     model = load_model()
     ground_truth = load_ground_truth()
     rng = new_rng()
-    conn = init_db(db_path) if db_path else init_db()
+
+    with WRITE_LOCK:
+        conn = init_db(db_path) if db_path else init_db()
 
     n_ok, n_failed = 0, 0
-    for _, row in events_df.iterrows():
-        try:
-            trace = decide_for_row(model, row, provider=provider)
-            true_prob = ground_truth[row["transaction_id"]][trace["agent_decision"]["action"]]
-            outcome = simulate_outcome(rng, true_prob, row["amount"])
-            record_decision_trace(conn, batch_id, "ai_agent", row, trace, outcome)
-            n_ok += 1
-        except Exception as exc:  # noqa: BLE001 - one bad row shouldn't kill the whole batch
-            n_failed += 1
-            print(f"  [batch {batch_id} / ai_agent] row {row.get('transaction_id')} failed: {exc!r}")
-    conn.commit()
-    conn.close()
+    try:
+        for _, row in events_df.iterrows():
+            try:
+                # ML prediction, EV ranking, and the agent/LLM call all
+                # happen here, OUTSIDE WRITE_LOCK. This is deliberate and
+                # load-bearing: provider.decide() can make a real network
+                # call (Gemini/Groq) that's allowed to run for a while, and
+                # in practice has been observed to hang well past its own
+                # `timeout=` value (see agent.py / STATUS.md §5) — a stuck
+                # socket read never raises, so code after it (including a
+                # lock release) never runs either. WRITE_LOCK must never
+                # wrap anything that can block indefinitely; it now only
+                # ever wraps the actual DB write below, which is always
+                # fast and always local.
+                trace = decide_for_row(model, row, provider=provider)
+                true_prob = ground_truth[row["transaction_id"]][trace["agent_decision"]["action"]]
+                outcome = simulate_outcome(rng, true_prob, row["amount"])
+                with WRITE_LOCK:
+                    record_decision_trace(conn, batch_id, "ai_agent", row, trace, outcome)
+                    conn.commit()
+                n_ok += 1
+            except Exception as exc:  # noqa: BLE001 - one bad row shouldn't kill the whole batch
+                n_failed += 1
+                print(f"  [batch {batch_id} / ai_agent] row {row.get('transaction_id')} failed: {exc!r}")
+    finally:
+        conn.close()
 
     return {"batch_id": batch_id, "policy_name": "ai_agent", "n_cases": n_ok, "n_failed": n_failed,
             "provider": provider.name}
@@ -131,36 +147,45 @@ def run_baseline_batch(policy_name: str, n: Optional[int] = None, batch_id: Opti
 
     ground_truth = load_ground_truth()
     rng = new_rng()
-    conn = init_db(db_path) if db_path else init_db()
+
+    with WRITE_LOCK:
+        conn = init_db(db_path) if db_path else init_db()
 
     n_ok, n_failed = 0, 0
-    for _, row in events_df.iterrows():
-        try:
-            state = state_from_event_row(row)
-            eligible = eligible_actions(state)
+    try:
+        for _, row in events_df.iterrows():
+            try:
+                state = state_from_event_row(row)
+                eligible = eligible_actions(state)
 
-            if policy_name == "do_nothing":
-                action, reason = "no_action", "Baseline policy: always no_action, regardless of eligibility."
-            else:  # generic_reminder
-                if "reminder" in eligible:
-                    action, reason = "reminder", "Baseline policy: always reminder when compliance allows it."
-                else:
-                    action, reason = "no_action", (
-                        "Baseline policy: reminder not eligible under current compliance state "
-                        f"(eligible={eligible}); falls back to no_action rather than escalate or "
-                        "discount, which would no longer be a 'generic' policy."
-                    )
+                if policy_name == "do_nothing":
+                    action, reason = "no_action", "Baseline policy: always no_action, regardless of eligibility."
+                else:  # generic_reminder
+                    if "reminder" in eligible:
+                        action, reason = "reminder", "Baseline policy: always reminder when compliance allows it."
+                    else:
+                        action, reason = "no_action", (
+                            "Baseline policy: reminder not eligible under current compliance state "
+                            f"(eligible={eligible}); falls back to no_action rather than escalate or "
+                            "discount, which would no longer be a 'generic' policy."
+                        )
 
-            trace = _baseline_trace(row, action, eligible, reason, provider_tag=f"baseline_{policy_name}")
-            true_prob = ground_truth[row["transaction_id"]][action]
-            outcome = simulate_outcome(rng, true_prob, row["amount"])
-            record_decision_trace(conn, batch_id, policy_name, row, trace, outcome)
-            n_ok += 1
-        except Exception as exc:  # noqa: BLE001
-            n_failed += 1
-            print(f"  [batch {batch_id} / {policy_name}] row {row.get('transaction_id')} failed: {exc!r}")
-    conn.commit()
-    conn.close()
+                trace = _baseline_trace(row, action, eligible, reason, provider_tag=f"baseline_{policy_name}")
+                true_prob = ground_truth[row["transaction_id"]][action]
+                outcome = simulate_outcome(rng, true_prob, row["amount"])
+                # No LLM call on this path (fixed-rule baseline), but locked
+                # the same way as run_batch() for consistency and so a large
+                # baseline run never holds the file lock for its whole
+                # duration either — see the note in run_batch() above.
+                with WRITE_LOCK:
+                    record_decision_trace(conn, batch_id, policy_name, row, trace, outcome)
+                    conn.commit()
+                n_ok += 1
+            except Exception as exc:  # noqa: BLE001
+                n_failed += 1
+                print(f"  [batch {batch_id} / {policy_name}] row {row.get('transaction_id')} failed: {exc!r}")
+    finally:
+        conn.close()
 
     return {"batch_id": batch_id, "policy_name": policy_name, "n_cases": n_ok, "n_failed": n_failed}
 

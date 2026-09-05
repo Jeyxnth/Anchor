@@ -29,9 +29,34 @@ is what a fresh install gets directly.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent / "ledger.db"
+
+# A batch run (run_batch()/run_baseline_batch() in app/batch.py) opens one
+# connection and doesn't commit until every row in the loop is written —
+# so it holds SQLite's write lock for the FULL duration of the run, not
+# just per-row. FastAPI dispatches sync `def` endpoints to a thread pool,
+# so two batch-writing requests arriving close together (double-click,
+# "Run Batch" + "Run Baseline Experiment" overlapping, two browser tabs)
+# genuinely execute concurrently — the second one's every row then fights
+# the first one's still-open transaction. Root-caused live 2026-09-05: a
+# 20-row rule-based batch took ~4 minutes and logged
+# `OperationalError('database is locked')` on all 20 rows, because two
+# other batches were mid-run at the same time and this connection's bare
+# `sqlite3.connect()` (no `timeout=`) only waited SQLite's 5s driver
+# default per attempt before giving up — with nothing to retry, every row
+# failed outright and the batch's own rows silently never landed (the
+# request still returned 200 with n_ok=0 to the caller).
+#
+# WRITE_LOCK below serializes every ledger-writing call in-process (used by
+# app/batch.py and the /recover endpoint in app/main.py) so concurrent
+# requests queue cleanly instead of racing SQLite's lock directly. This is
+# not a workaround for SQLite being single-writer — SQLite already only
+# allows one writer — it's making that constraint explicit and queued at
+# the application level instead of surfacing as a silent per-row failure.
+WRITE_LOCK = threading.Lock()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -95,9 +120,23 @@ INDEXES = [
 
 
 def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+    # timeout=30: how long THIS connection will busy-wait for a lock before
+    # raising OperationalError, instead of the sqlite3 driver's 5s default
+    # (see WRITE_LOCK note above for why 5s wasn't enough). Belt-and-
+    # suspenders with WRITE_LOCK, not a substitute for it — WRITE_LOCK
+    # prevents the contention from happening at all for writers in this
+    # process; this timeout is what protects a reader (a /metrics or
+    # /audit call) that lands mid-write, or any writer outside this
+    # process (e.g. a manual sqlite3 CLI session against ledger.db).
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL instead of the default rollback-journal mode: lets readers
+    # (GET /metrics, GET /audit, GET /batch/...) proceed without blocking
+    # on an in-progress writer. Doesn't change SQLite's single-writer
+    # limit (nothing can) — WRITE_LOCK is what serializes writers.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 

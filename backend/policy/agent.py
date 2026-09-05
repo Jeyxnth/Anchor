@@ -27,6 +27,27 @@ written; current model IDs were pulled from a live GET /v1beta/models call
 against the key, not guessed. GroqProvider remains untested (no GROQ_API_KEY
 available). Re-check available model IDs before a demo if this sits for a
 while — these surfaces drift.
+
+NOTE (2026-09-05): confirmed live via Google AI Studio's usage dashboard
+that the free tier on gemini-3.5-flash-lite has both a per-minute (RPM)
+and a per-day (RPD) cap, and we exceeded both (21/15 RPM, 501/500 RPD) —
+distinct problems needing distinct fixes. RPM is fixed permanently by
+pacing every real call to at least GEMINI_MIN_CALL_INTERVAL_SECONDS apart
+(see below GeminiProvider — process-wide, not per-instance). RPD is a hard
+wall for the rest of that day on that key; pacing cannot fix it. A 429 is
+now classified (QuotaExceededError, distinct from a timeout/503) and, when
+it's specifically the per-day quota, latches _gemini_daily_quota_exhausted
+so every later call in this process fails instantly without hitting the
+network — see the comments around both for the full reasoning. Swapping
+GEMINI_API_KEY in .env and restarting the backend picks up the new key
+with no other change needed: agent.py's load_dotenv(override=False) below
+runs once per process at import time, GeminiProvider.__init__() reads
+os.environ.get("GEMINI_API_KEY") fresh on every instance (get_provider()
+constructs a new one per request), and a restart clears the in-memory
+_gemini_daily_quota_exhausted latch along with everything else — the one
+way this could fail to pick up a new key is if GEMINI_API_KEY is ALSO
+exported as a real OS/shell environment variable (override=False means
+that would win over .env); it isn't in this project's normal setup.
 """
 
 from __future__ import annotations
@@ -34,6 +55,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,6 +196,88 @@ def validate_decision(raw: dict, decision_input: DecisionInput, provider_name: s
     )
 
 
+# --- Free-tier rate limiting, shared by every GeminiProvider instance in
+# this process --------------------------------------------------------------
+#
+# Confirmed live (2026-09-05, Google AI Studio usage dashboard) that
+# gemini-3.5-flash-lite's free tier has two independent caps: ~15 requests
+# per minute (RPM), and 500 requests per day (RPD). We were over both
+# (21/15 RPM, 501/500 RPD). RPM is a pacing problem — permanently fixable
+# in code. RPD is a hard wall for the rest of that day on that key —
+# pacing can't fix it, only a fresh key (or the next day) can.
+#
+# GEMINI_MIN_CALL_INTERVAL_SECONDS: minimum gap enforced between the START
+# of any two Gemini network calls, process-wide (a threading.Lock, not
+# per-instance — get_provider() constructs a new GeminiProvider per
+# request, so per-instance state wouldn't coordinate across concurrent
+# requests). 60/15 = 4.0s is the exact RPM boundary; default 4.5s leaves
+# margin (~13.3 req/min ceiling) for clock jitter. Env-overridable in case
+# a different key/tier ever has a different cap.
+GEMINI_MIN_CALL_INTERVAL_SECONDS = float(os.environ.get("GEMINI_MIN_CALL_INTERVAL_SECONDS", "4.5"))
+_GEMINI_RATE_LOCK = threading.Lock()
+_gemini_last_call_started_at = [0.0]  # 1-item list: mutable without `global`
+
+
+def _gemini_throttle() -> None:
+    """Block the calling thread just long enough that this call starts at
+    least GEMINI_MIN_CALL_INTERVAL_SECONDS after the previous one started,
+    process-wide. Holding the lock across the sleep is deliberate here —
+    unlike a network call, this wait is bounded and known in advance
+    (never more than GEMINI_MIN_CALL_INTERVAL_SECONDS), so it can't
+    reproduce the WRITE_LOCK-held-across-an-unbounded-call bug (see
+    app/db.py) — it's the opposite case: a lock that's SUPPOSED to
+    serialize calls with a real, small, guaranteed-to-end wait."""
+    with _GEMINI_RATE_LOCK:
+        now = time.monotonic()
+        wait = GEMINI_MIN_CALL_INTERVAL_SECONDS - (now - _gemini_last_call_started_at[0])
+        if wait > 0:
+            time.sleep(wait)
+        _gemini_last_call_started_at[0] = time.monotonic()
+
+
+# Latched for the lifetime of this process once a per-DAY quota exhaustion
+# is confirmed (see _classify_quota_scope below) — every subsequent Gemini
+# call, from any request, fails instantly without hitting the network at
+# all, since we already know for certain it would just be another 429.
+# Per-MINUTE exhaustion does NOT set this — that's transient (self-clears
+# within a minute) and the pacing above is what prevents it recurring.
+# Cleared only by restarting the process: swapping GEMINI_API_KEY in .env
+# and restarting picks up a fresh key with a fresh quota (see get_provider()
+# note), and Google's own daily counter also resets at a fixed clock time —
+# either way, a restart is the reset path, matching how this key gets
+# rotated in practice.
+_gemini_daily_quota_exhausted = threading.Event()
+
+
+class QuotaExceededError(RuntimeError):
+    """Raised for a 429/RESOURCE_EXHAUSTED response — kept distinct from a
+    transient network failure (timeout, 503) so it's recognizable as such
+    in the audit trail (validation_note) rather than looking identical to
+    a temporary blip. `scope` is best-effort: 'day' or 'minute' when
+    Google's error body names which quota metric was hit (its documented
+    QuotaFailure.violations[].quotaId format, e.g. containing
+    'PerDayPerProject' or 'PerMinutePerProject'), else 'unknown'. Only
+    'day' latches _gemini_daily_quota_exhausted — an 'unknown' 429 is
+    treated as transient rather than risk incorrectly suppressing calls
+    that would have succeeded again within a minute."""
+
+    def __init__(self, message: str, scope: str):
+        super().__init__(message)
+        self.scope = scope
+
+
+def _classify_quota_scope(exc: Exception) -> str:
+    try:
+        body = exc.response.text.lower()
+    except Exception:  # noqa: BLE001 - response body isn't guaranteed text/decodable
+        return "unknown"
+    if "perday" in body or "per_day" in body or "requestsperday" in body:
+        return "day"
+    if "perminute" in body or "per_minute" in body or "requestsperminute" in body:
+        return "minute"
+    return "unknown"
+
+
 class GeminiProvider(LLMProvider):
     """Google AI Studio Gemini API (free tier: Flash-Lite). Reads GEMINI_API_KEY.
     Model id via GEMINI_MODEL env var (default below) — check current Google AI
@@ -206,6 +311,17 @@ class GeminiProvider(LLMProvider):
     def _call(self, model: str, decision_input: DecisionInput):
         import requests
 
+        if _gemini_daily_quota_exhausted.is_set():
+            # Already confirmed exhausted this process's lifetime — don't
+            # bother pacing or making the request, it can only 429 again.
+            raise QuotaExceededError(
+                "Gemini daily quota already confirmed exhausted this session (process); "
+                "not attempting another call. Restart the backend after the quota resets "
+                "or after swapping in a fresh GEMINI_API_KEY.",
+                scope="day",
+            )
+        _gemini_throttle()  # never skip this: it's what keeps us under the RPM cap
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
         payload = {
             "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
@@ -213,7 +329,17 @@ class GeminiProvider(LLMProvider):
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
         }
         resp = requests.post(url, json=payload, timeout=20)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 429:
+                scope = _classify_quota_scope(exc)
+                if scope == "day":
+                    _gemini_daily_quota_exhausted.set()
+                raise QuotaExceededError(
+                    f"Gemini quota exceeded (scope={scope}): {exc}", scope=scope
+                ) from exc
+            raise
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         return text
@@ -232,6 +358,14 @@ class GeminiProvider(LLMProvider):
             text = self._call(self.model, decision_input)
             model_used = self.model
         except Exception as exc:  # noqa: BLE001
+            # QuotaExceededError deliberately falls straight through here:
+            # it isn't a requests.HTTPError, so _is_model_not_found() is
+            # False for it regardless of scope, and this re-raises without
+            # attempting the fallback-model retry below — a quota problem
+            # (per-minute OR per-day) is a project/key-level limit that
+            # trying a different model id wouldn't fix, and ResilientProvider
+            # still catches it and falls back to rule_based_fallback for
+            # this decision either way.
             if not self._is_model_not_found(exc) or self.model == self.fallback_model:
                 raise  # not a model-ID problem (or already on the fallback id) — let ResilientProvider handle it
             # One retry against the fallback model id (see __init__ note) before
