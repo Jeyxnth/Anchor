@@ -45,6 +45,29 @@ never *offered* a forbidden action (pre-filter), and its actual output is
 never *trusted blindly* (validator). Both are tested directly, not just
 assumed.
 
+## Where AI is — and isn't — used
+
+The LLM's job is deliberately narrow: **choosing and explaining one
+action from an already-filtered, already-ranked shortlist.** Everything
+else is plain, deterministic code:
+
+- **Compliance filtering and validation** — code, not AI. Eligibility
+  rules and the correction of invalid agent output are hardcoded checks,
+  precisely because "the AI decided it was fine" is not an acceptable
+  compliance guarantee.
+- **Expected-value ranking** — arithmetic
+  (`probability × amount − cost`), not AI.
+- **Outcome simulation and the audit ledger** — deterministic sampling
+  and database writes, not AI.
+- **Recovery probability itself** — a trained classical ML model
+  (XGBoost/Logistic Regression), not an LLM guess.
+
+An LLM is powerful at judgment calls with ambiguous context; it is not
+something to trust with a compliance boundary or a probability estimate
+that needs to be independently verifiable. This system uses AI only where
+it's genuinely the right tool, and deterministic code everywhere a wrong
+call would actually cost money or break a rule.
+
 ## Results
 
 Full 4,000-transaction batch, ₹17,07,076.43 total revenue at risk, same
