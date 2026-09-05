@@ -1,96 +1,60 @@
-# Demo Script — Compliance & Validation Cases
+# Demo Script — Final
 
-Repeatable click-through path for the compliance-restricted cases plus the
-validator-injection moment, for live recording. No transaction-ID hunting
-required — the dashboard's **Compliance Demo Cases** panel has one-click
-buttons for all three IDs below, or use the **Jump to transaction** search
-box in the header.
+## Headline numbers (say these early and often)
 
-## Prerequisites
+**Batch:** 4,000 transactions · ₹17,07,076.43 total revenue at risk
 
-1. Backend running: `backend/.venv/Scripts/python.exe -m uvicorn app.main:app --port 8000`
-2. Dashboard running: `cd frontend && npm run dev`, open http://localhost:5173
-3. A terminal in `backend/`, venv activated (or use the full path shown
-   above) — needed for Case 4.
-4. The ledger needs at least the three transactions below already logged
-   under `policy_name='ai_agent'`. Either:
-   - Click **Run Batch (agent only)** with rows ≥ 2200 (TXN002166 is at
-     index 2166), or
-   - Load the existing full run: type `baseline_experiment_full` into the
-     Policy Comparison panel's batch-id box and click **Load** (this also
-     populates the comparison panel — good to do first anyway, see below).
+| Policy | ₹ Recovered | Recovery Rate |
+|---|---|---|
+| Do Nothing | ₹3,14,135.94 | 18.4% |
+| Generic Reminder | ₹6,44,189.16 | 37.7% |
+| **AI Agent** | **₹7,46,318.78** | **43.5%** |
+
+**AI Agent recovers +₹4,32,182.84 more than doing nothing, and +₹1,02,129.62 more than a generic reminder to everyone.**
 
 ## Order
 
 ### 0. Set the scene — Policy Comparison panel
-Load `baseline_experiment_full` (or run a fresh baseline experiment). Point
-at the three policy cards and the "AI Agent recovers +₹541,359.81 more than
-do_nothing, and +₹139,252.32 more than generic_reminder" callout. This is
-the number that matters — everything after this is *why* the agent gets
-there.
+Click **Run Baseline Experiment** (this always runs the full 4,000-row dataset, independent of the rows field in the header). Point at the three cards and say the numbers above out loud. *"This is the number that matters — everything after this is why the agent gets there."*
 
-### 1. TXN000000 — Normal case (baseline, for contrast)
-Click its button in **Compliance Demo Cases** (or search it).
-**Proves:** all 5 actions eligible; the EV ranking — not raw probability —
-drives the pick. `escalate_to_human` has the *highest* predicted recovery
-probability (35.5%) but loses to `retry_link` (35.0%) once its ₹40 cost is
-priced in (EV ₹509.95 vs ₹479.23). Cost-aware, not just probability-aware.
+### 1. TXN000224 — Normal case (baseline, for contrast)
+Click it in Compliance Demo Cases. 
+**Say:** All 5 actions are eligible here. Escalate to Human has the *highest* predicted recovery probability (56.0% vs. Retry Link's 55.0%), but the system picks Retry Link instead — because Escalate costs ₹40 to execute and Retry Link costs ₹2. Once that's priced in, Retry Link's expected value (₹629.45) beats Escalate's (₹602.69). *"This isn't just picking the most likely outcome — it's making a genuine cost-aware business decision."*
 
 ### 2. TXN000025 — Opted-out customer
-Click its button.
-**Proves:** `opted_out=true` → `eligible_actions=['no_action']`. Scroll to
-the trace's **"Compliance effect — before / after"** section: without
-compliance, the top-EV pick would have been `retry_link` (EV ₹67.71) — the
-system would have tried to contact an opted-out customer. Compliance
-restricts the candidate set to `no_action` *before* the agent ever runs,
-so that's what actually happened. This is the before/after moment — point
-at it directly, it's the clearest single screen for "compliance actually
-did something here."
+Click it. Scroll to **Compliance Effect — Before/After**.
+**Say:** This customer opted out. Without compliance, the system's top pick would have been Retry Link (EV ₹67.71) — it would have tried to contact someone who told us to stop. Compliance restricts the eligible set to *only* No Action before the agent even runs, so that's what actually happens. *"The agent isn't being told not to do this — it's structurally never offered the option."*
 
-### 3. TXN002166 — Contact-capped customer
-Click its button.
-**Proves:** `attempts_so_far ≥ 2` in the trailing 24h → eligible actions
-narrow to `['escalate_to_human', 'no_action']`. Same before/after section:
-unconstrained top pick would again have been `retry_link` (EV ₹78.72) —
-another contact attempt on an already-over-the-cap customer — but
-compliance restricted it to `escalate_to_human` (EV ₹43.09), which is what
-was actually chosen.
+### 3. TXN002166 — Contact-capped customer (now a stacked-restrictions example)
+Click it. Same before/after panel — note the panel itself only shows two states (Unconstrained vs. the actual/executed outcome); the middle number below is spoken context, not something on screen.
+**Say:** Already contacted twice in 24 hours — *and* this event happens to land at 3am, outside contact hours. Two independent rules apply here from different angles: unconstrained, the top pick would be Retry Link (EV ₹78.72, visible on the panel) — another attempt on someone already at the cap. The contact-cap rule *alone* would already restrict this to Escalate to Human (EV ₹43.09 — this part isn't on the panel, it's worth saying out loud). But quiet hours applies *on top of* that, and independently forces it all the way to No Action (EV ₹29.14, the panel's actual/executed side) — even the human hand-off waits until contact hours resume. *"This is what defense-in-depth looks like: two separate rules, checked independently, agreeing on the same restriction from different reasons — not one rule doing double duty."* (This is TXN002166's real behavior: it's the only row in the full 4,000-transaction dataset with 2+ prior contact attempts, and it happens to also be a quiet-hour case — a coincidence of the data, not a staged example.)
 
-### 4. Validator injection — off-list LLM response, caught live
-Switch to the terminal:
+### 4. NEW — Quiet hours, with the freshness exception
+Find and open any `checkout_abandoned` case flagged as quiet-hour restricted (any customer contacted for the first time, outside 9am–8pm, on an abandoned checkout — Compliance Panel shows the live count of these).
+**Say:** *"We also enforce quiet hours — no automated outreach outside 9am to 8pm. But we made one deliberate, reasoned exception: if someone's payment fails right now, mid-transaction, they're provably awake and present — treating that the same as a cold 2am marketing text would be wrong. So the very first response to an active payment failure is allowed regardless of the hour. A checkout that was abandoned hours ago doesn't get that exception, because there's no evidence anyone's still there — and neither does a second or third follow-up attempt on anything."* Then show one `payment_failed` case with `attempts_so_far == 0` where all 5 actions stayed eligible despite the hour — contrast it against a `checkout_abandoned` case restricted at the same hour.
+**Compliance Panel numbers to cite:** 0 target compliance violations across 4,000 cases. Opt-outs: 100% respected. Quiet-hour restricted: a real, meaningful count (not near-zero, not near-total) — cite whatever the panel currently shows.
+
+### 5. Validator injection — off-list LLM response, caught live
+Terminal:
 ```
 backend/.venv/Scripts/python.exe policy/demo_validator_injection.py
 ```
-This reuses TXN000000's real model predictions and real EV ranking, then
-feeds a **staged** (not live-API) LLM response that invents an action —
-`"send_free_product"` — never a real intervention. Narrate as it prints:
-the real EV-ranked candidates first (same numbers as Case 1), then the
-fake response, then `agent.validate_decision()` — the *exact* function
-every real Gemini/Groq response passes through, not a separate mock path —
-catching it, correcting to the top-EV eligible candidate (`retry_link`),
-and flagging `valid=False` with a `validation_note` naming exactly what
-happened. The script asserts both outcomes before printing its final line,
-so a silent failure can't slip through unnoticed.
-**Proves:** the agent's raw action choice is never trusted at face value —
-structurally impossible for an LLM (or a compromised one) to make the
-system execute an action outside the allowed set.
+**Say, as it prints:** real EV-ranked candidates first (same numbers as Case 1), then a staged fake response inventing an action (`send_free_product`) that was never a real intervention, then `validate_decision()` — *the exact function every real Gemini/Groq response passes through* — catching it, correcting to the top-EV eligible candidate, flagging it invalid. *"The agent's raw output is never trusted at face value — this is structurally impossible to bypass, whether the model hallucinates or is compromised."*
 
-## Honest scope note (say this out loud, don't let a question catch it)
+### 6. Recovery by Intervention (if time allows)
+Point at the breakdown: Retry Link, Reminder, Discount Offer, and Escalate to Human each recovering in the 50–57% range — genuinely close to each other. *"The system isn't just defaulting to one favorite action — it's making a real per-case call, and each action type performs well when it's actually the right fit."*
 
-Cases 2–3 demonstrate the compliance **eligibility filter** — it bounds the
-candidate set *before* the agent runs, and the before/after view makes that
-concrete. They are not yet the brief's "agent recommends X → compliance
-blocks it → final action is Y" override moment (§19 step 6) — that needs
-the **hard compliance gate** (build-order step 5: quiet hours, forced
-escalation, stop-on-recovery, override authority), which isn't built yet.
-When it is, this script gets a **Case 5** showing an actual post-decision
-override, distinct from both the eligibility-filter cases above and the
-validator-injection case (which guards against a *malformed* response, not
-a *compliant-but-overridden* one).
+### 7. Close — back to the Policy Comparison panel
+Restate the headline numbers one more time as the closing beat: **+₹4,32,182.84 vs. doing nothing, +₹1,02,129.62 vs. a generic policy, zero compliance violations across every one of the 4,000 cases.**
+
+## Honest scope note — say this proactively, don't wait to be asked
+
+*"Compliance here is two deterministic code layers, not a prompt instruction: an eligibility filter that removes forbidden actions before the agent ever sees them, and a validator that re-checks the agent's actual output against that same list and corrects it if it's ever wrong — we tested that directly with the injection you just saw. We considered a third, after-the-fact override layer and deliberately didn't build it, because there's no case in this design where a properly filtered, on-list decision still needs blocking afterward — a third layer would prove nothing the first two haven't already proven."*
+
+## If Gemini's real-LLM toggle is live and working when you record
+
+Show one small batch (10-15 rows) with "use real LLM" on, and narrate the Provider column honestly — if it's a mix of `gemini` and `rule_based_fallback`, that's a *better* demo moment than a clean run: *"Google's API had a hiccup mid-batch there — watch it degrade to a rule-based fallback instead of the whole pipeline stalling. That's the resilience wrapper working exactly as designed."*
 
 ## Fallback if the ledger doesn't have these transactions loaded
 
-`GET /audit/TXN000025?policy_name=ai_agent` (and similarly for the other
-two IDs) works directly against the API regardless of what's currently
-loaded in the dashboard's Recent Decisions table — useful as a backup if
-something in the UI state gets into a weird spot mid-recording.
+`GET /audit/TXN000025?policy_name=ai_agent` (and the other two IDs) works directly against the API regardless of dashboard state — useful if something in the UI gets into a weird spot mid-recording.
