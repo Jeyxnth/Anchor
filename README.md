@@ -119,7 +119,7 @@ provider without it) goes in a `.env` file at the repo root or in
   model, not real customer behavior.
 - A single model uses `intervention` as a feature rather than separate
   per-action models — a reasonable MVP simplification.
-- Quiet hours (9am–8pm) are enforced with one deliberate exception: the
+- Quiet hours (9pm–8am) are enforced with one deliberate exception: the
   very first automated response to an active payment failure is allowed
   regardless of hour, since the customer is provably present
   mid-transaction. Abandoned checkouts and repeat attempts still respect
