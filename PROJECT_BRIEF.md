@@ -36,11 +36,16 @@ Revenue Risk Engine          (prioritizes cases: amount × risk × urgency)
         ↓
 ML Recovery Prediction        (P(recovery | customer, context, intervention) — per action)
         ↓
-Intervention / Expected-Value Policy   (EV per allowed action)
+Compliance Eligibility Pre-Filter   (deterministic code — removes forbidden actions from
+                                     the candidate set before anything downstream sees them)
         ↓
-AI Decision Agent             (LLM — chooses among allowed actions, explains why)
+Intervention / Expected-Value Policy   (EV per eligible action only)
         ↓
-Hard Compliance Gate          (deterministic code — can override/block the agent)
+AI Decision Agent             (LLM — chooses among eligible actions, explains why)
+        ↓
+Decision Validator            (deterministic code — re-checks the agent's actual output
+                                against that same eligible list; corrects and flags
+                                anything invalid)
         ↓
 Execution Simulator           (simulated send: retry link / reminder / discount / escalate / no-op)
         ↓
@@ -51,7 +56,17 @@ Audit Ledger + Metrics Engine
 Dashboard ("Revenue Recovery Control Center")
 ```
 
-The LLM sits in the middle of this pipeline, not at the top of it. It never has the final word — the compliance gate does.
+The LLM sits in the middle of this pipeline, not at the top of it. It never has the final word — compliance enforcement does, in two deterministic layers:
+
+```
+Compliance enforcement (two layers, both deterministic code):
+  1. Eligibility pre-filter — runs BEFORE the agent; removes any
+     forbidden action from the candidate set entirely, so the agent
+     is never even offered an illegal option
+  2. Decision validator — re-checks the agent's actual output
+     against that same eligible list; corrects and flags anything
+     invalid
+```
 
 ## 5. Data schema (synthetic — primary data source for MVP)
 
@@ -119,23 +134,31 @@ Constraints:
 - The LLM is a **decision-and-explanation layer**, not the final authority.
 - Provider-agnostic interface, structured JSON output enforced regardless of which model sits behind it. Use a free-tier API (Gemini Flash-Lite via Google AI Studio, or Groq) — no paid API is required at this project's scale.
 
-## 9. Compliance gate (deterministic code — final authority)
+## 9. Compliance enforcement (two layers, both deterministic code)
 
-Rules:
-- Max N contact attempts per customer per rolling 24h window.
-- No contact outside allowed hours (e.g. 9am–8pm).
-- Immediate, permanent stop if `opted_out = true`.
-- Stop immediately on confirmed recovery.
-- After M failed attempts, force `escalate_to_human` rather than continuing automated retries.
-- Any action violating policy is blocked, full stop — regardless of the agent's reasoning or expected-value score.
+Compliance is enforced by two layers, not a single post-hoc gate:
 
-**This override must be visibly demonstrated in the demo**, e.g.:
+**1. Eligibility pre-filter** — runs BEFORE the agent. Computes the allowed candidate set from the customer's compliance state and removes any forbidden action from it entirely, so the agent is never even offered an illegal option:
+- `opted_out = true` → eligible actions = `[no_action]` only.
+- 2+ contact attempts in the trailing rolling 24h window → eligible actions = `[escalate_to_human, no_action]` (forces escalation rather than another automated retry).
+- Outside 9am–8pm (quiet hours) → eligible actions = `[no_action]` only — with one deliberate exception: the first automated response to an active `payment_failed` event (`attempts_so_far == 0`) is exempt, since the customer is provably present mid-transaction. `checkout_abandoned` events and any repeat attempt still respect the restriction. (Added after this section was first written — see README.md for live numbers.)
+- Otherwise → all 5 actions are eligible.
 
-> Agent recommends: `reminder` → Compliance check: `opted_out = true` → **BLOCKED** → Final action: `no_action`
+**2. Decision validator** — runs AFTER the agent. Re-checks the agent's returned action against that *same* eligible list — never a separate, looser check. If the action isn't on the list, or the response is malformed, it's corrected to the top expected-value eligible candidate and flagged (`valid=False`, with a note recording exactly what was wrong) — never silently accepted, never silently swallowed.
 
-> Agent recommends: `retry_link` → Compliance check: already contacted twice in 24h → **BLOCKED** → Final action: `escalate_to_human`
+**This must be visibly demonstrated in the demo**, e.g.:
 
-This is one of the highest-value moments in the whole demo — it's the difference between "the AI is well-behaved" (a claim) and "the AI cannot misbehave" (a proof).
+> Customer is opted-out → `eligible_actions = [no_action]` → the agent never sees `retry_link` as an option in the first place.
+
+> Customer already contacted twice in 24h → `eligible_actions = [escalate_to_human, no_action]` → the agent never sees `retry_link` / `reminder` / `discount_offer` as options.
+
+This is a *stronger* guarantee than a post-hoc block would be — the agent is structurally incapable of choosing a forbidden action, not caught and corrected after choosing one. The trade-off is narrative, not strength: the demo shows "the option never existed," not "the agent recommended X and got overridden to Y." It's still one of the highest-value moments in the whole demo — the difference between "the AI is well-behaved" (a claim) and "the AI cannot misbehave" (a proof).
+
+**What these two layers do NOT cover** (real gaps, not implemented by either layer):
+- Forced escalation after M *cumulative* failed attempts — the pre-filter's contact-cap is a rolling-24h *contact count*, not a cumulative-failure counter; related but not the same rule.
+- Stop on confirmed recovery — not applicable yet; the pipeline scores one event per transaction, not a multi-touch sequence with running state to stop.
+
+(Quiet hours was in this list originally; it's implemented now — see the pre-filter rules above.)
 
 ## 10. Execution simulator
 
@@ -254,11 +277,11 @@ The demo should make it obvious this recovers measurable revenue, not that it ge
 2. **ML pipeline** — train, proper split, honest eval report (precision/recall/confusion matrix/optimality gap).
 3. **Expected-value policy layer** — turn per-intervention probabilities into an EV ranking among allowed actions.
 4. **Decision agent** — structured JSON in/out, fixed action set, reasoning string.
-5. **Compliance gate** — enforced code, with explicit tests for each override case (opt-out, contact cap, quiet hours, escalation).
+5. **Compliance gate** — ~~enforced code, with explicit tests for each override case (opt-out, contact cap, quiet hours, escalation)~~. **Resolved as a design decision, not left undone:** built as the two-layer eligibility-pre-filter + decision-validator design in §9 instead of a single post-hoc gate — opt-out, contact cap, and quiet hours (with its first-attempt exception) are all enforced there. See §9 for why a third, after-the-fact override layer was deliberately not built on top of that.
 6. **Execution + outcome simulators.**
 7. **Audit ledger.**
 8. **Baseline experiment** — do nothing / generic / agent, run on the same batch.
 9. **Dashboard** — KPI cards, per-intervention breakdown, compliance panel, recent decisions, stopping reasons.
-10. **Deliberate compliance-override demo case** — confirm it behaves and is easy to show live.
+10. **Deliberate compliance-override demo case** — ~~confirm it behaves and is easy to show live~~. **Resolved as a design decision, not left undone:** the actual demo (see `DEMO_SCRIPT.md` Cases 1–3, incl. the quiet-hours stacked-restrictions case) shows the eligibility pre-filter and the decision validator directly instead — there is no separate "agent recommends X → gate blocks it → final action is Y" override moment, because there's no third gate layer to demonstrate one from.
 11. **README** — architecture, metrics, limitations.
 12. **Record demo video**, structured around §19.
